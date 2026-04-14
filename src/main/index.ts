@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, nativeImage } from 'electron'
 import { basename, extname, join } from 'path'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync, rmSync } from 'fs'
 import { spawn, ChildProcess } from 'child_process'
@@ -34,18 +34,17 @@ import {
   type LogLevel,
   type LogThreshold,
   type UsageLogEntry,
+  clearActiveLogs,
   ensureLoggingDirs,
   getAvailableLogDomains,
   getCurrentRunId,
   getUserDiagnosticSummary,
   getLogThreshold,
   normalizeLogThreshold,
-  clearActiveLogs,
   readDiagnosticEvents,
   readStructuredLogs,
   recordFailure,
   recordMilestone,
-  recordRetry,
   readTextFile,
   sanitizeForLogging,
   setLogThreshold,
@@ -54,6 +53,18 @@ import {
   writeRendererLog,
   writeUsageLog,
 } from './logging'
+import {
+  deleteInstalledSkill,
+  discoverSkills,
+  installDiscoveredSkill,
+  listDiscoveredSkills,
+  listInstalledSkills,
+  listSkillRepositories,
+  previewDiscoveredSkill,
+  readInstalledSkill,
+  removeSkillRepository,
+  saveSkillRepository,
+} from './skills-market'
 
 type PersistedSubagent = { taskId: string; label: string; status: string }
 
@@ -80,9 +91,30 @@ function getModuleKey(subagent?: PersistedSubagent): string {
 
 const HARNESSCLAW_LAUNCHED_FLAG = join(HARNESSCLAW_DIR, '.launched')
 const HARNESSCLAW_ENGINE_BIN = resolveBundledBinaryPath('harnessclaw-engine')
-const SKILLS_DIR = join(HARNESSCLAW_DIR, 'workspace', 'skills')
-
 let harnessclawEngineProcess: ChildProcess | null = null
+
+function resolveDevIconPath(): string | undefined {
+  const candidates = [
+    join(process.cwd(), 'resources', 'icon.png'),
+    join(app.getAppPath(), 'resources', 'icon.png'),
+  ]
+
+  return candidates.find((candidate) => existsSync(candidate))
+}
+
+function applyDevAppIcon(): string | undefined {
+  const iconPath = resolveDevIconPath()
+  if (!iconPath) return undefined
+
+  if (process.platform === 'darwin') {
+    const image = nativeImage.createFromPath(iconPath)
+    if (!image.isEmpty()) {
+      app.dock.setIcon(image)
+    }
+  }
+
+  return iconPath
+}
 
 interface PickedLocalFile {
   name: string
@@ -101,7 +133,13 @@ interface AppRuntimeStatus {
   lastError?: string
 }
 
-function logInfo(domain: DiagnosticDomain, action: string, summary: string, details?: Record<string, unknown>, projectTo: 'app' | 'renderer' = 'app'): void {
+function logInfo(
+  domain: DiagnosticDomain,
+  action: string,
+  summary: string,
+  details?: Record<string, unknown>,
+  projectTo: 'app' | 'renderer' = 'app',
+): void {
   recordMilestone({
     domain,
     action,
@@ -228,11 +266,11 @@ function trackUsage(entry: UsageLogEntry): void {
     logFailure(
       'ui',
       'usage.persist',
-      '使用记录保存失败',
+      'Failed to persist usage event',
       error instanceof Error ? error.message : String(error),
-      '使用统计可能缺失，但不影响主功能运行',
-      '可稍后查看日志或重试当前操作',
-      { entry, error },
+      'Usage analytics may be incomplete, but core features can continue running.',
+      'You can inspect the logs and retry the action if needed.',
+      { entry, error: String(error) },
     )
   }
   writeUsageLog({ ...entry, details, createdAt })
@@ -286,18 +324,24 @@ function startHarnessclawEngine(): void {
     logFailure(
       'runtime.harnessclaw',
       'start',
-      '本地运行时启动失败：未找到可执行文件',
-      'bundled binary 缺失',
-      '本地运行时不可用，聊天与连接功能无法工作',
-      '请确认 resources/bin 下存在 harnessclaw-engine 可执行文件',
+      'Local runtime failed to start because the bundled binary was not found',
+      'Bundled harnessclaw-engine binary is missing.',
+      'Local runtime features cannot initialize, so chat and connectivity may be unavailable.',
+      'Verify that resources/bin contains the expected harnessclaw-engine executable.',
       { binaryPath: HARNESSCLAW_ENGINE_BIN || '<missing>' },
     )
     return
   }
-  logInfo('runtime.harnessclaw', 'start.requested', '已请求启动本地运行时', {
+
+  logInfo('runtime.harnessclaw', 'start.requested', 'Requested local runtime startup', {
     binaryPath: HARNESSCLAW_ENGINE_BIN,
     configPath: ENGINE_CONFIG_PATH,
+    currentStatus: 'Startup request has been issued.',
+    impact: 'The local engine process should come online shortly.',
+    suggestion: 'No action is needed unless startup fails.',
   })
+
+  console.log('[HarnessclawEngine] Starting engine...')
   harnessclawEngineProcess = spawn(HARNESSCLAW_ENGINE_BIN, ['-config', ENGINE_CONFIG_PATH], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
@@ -309,28 +353,35 @@ function startHarnessclawEngine(): void {
     process.stderr.write(`[HarnessclawEngine] ${data}`)
   })
   harnessclawEngineProcess.on('error', (err) => {
+    console.error('[HarnessclawEngine] Failed to start:', err)
     logFailure(
       'runtime.harnessclaw',
       'start',
-      '本地运行时启动失败：进程创建未成功',
+      'Local runtime failed to spawn',
       err instanceof Error ? err.message : String(err),
-      '本地运行时不可用，聊天与连接功能无法工作',
-      '请检查本地运行时文件和配置是否有效',
-      { error: err },
+      'Local runtime features remain unavailable until the engine can start.',
+      'Check the runtime binary and engine config, then retry startup.',
+      { error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err) },
     )
     harnessclawEngineProcess = null
   })
   harnessclawEngineProcess.on('exit', (code) => {
+    console.log('[HarnessclawEngine] Exited with code:', code)
     if (code === 0 || code === null) {
-      logInfo('runtime.harnessclaw', 'stop', '本地运行时已停止', { exitCode: code })
+      logInfo('runtime.harnessclaw', 'stop', 'Local runtime stopped', {
+        exitCode: code,
+        currentStatus: 'The engine process is no longer running.',
+        impact: 'New requests will wait until the runtime is started again.',
+        suggestion: 'If this was not expected, inspect the runtime logs.',
+      })
     } else {
       logFailure(
         'runtime.harnessclaw',
         'exit',
-        '本地运行时异常退出',
-        `退出码 ${code}`,
-        '本地服务连接会中断，相关功能暂时不可用',
-        '请检查本地运行时日志并尝试重新启动应用',
+        'Local runtime exited unexpectedly',
+        `Process exited with code ${code}.`,
+        'The websocket connection and runtime-backed features may stop working.',
+        'Review the runtime logs and restart the application or engine.',
         { exitCode: code },
       )
     }
@@ -340,12 +391,18 @@ function startHarnessclawEngine(): void {
 
 function stopHarnessclawEngine(): void {
   if (!harnessclawEngineProcess) return
-  logInfo('runtime.harnessclaw', 'stop.requested', '已请求停止本地运行时')
+  console.log('[HarnessclawEngine] Stopping engine...')
+  logInfo('runtime.harnessclaw', 'stop.requested', 'Requested local runtime shutdown', {
+    currentStatus: 'Shutdown signal has been sent to the engine process.',
+    impact: 'Local runtime activity will stop during app shutdown or manual disconnect.',
+    suggestion: 'No action is needed unless the process does not exit cleanly.',
+  })
   harnessclawEngineProcess.kill('SIGTERM')
   harnessclawEngineProcess = null
 }
 
 function createWindow(): BrowserWindow {
+  const devIconPath = is.dev ? applyDevAppIcon() : undefined
   const mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -356,6 +413,7 @@ function createWindow(): BrowserWindow {
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 16, y: 16 },
     backgroundColor: '#F5F5F7',
+    ...(process.platform === 'darwin' ? {} : devIconPath ? { icon: devIconPath } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -387,22 +445,22 @@ app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.iflytek.harnessclaw')
   ensureLoggingDirs()
   setLogThreshold(normalizeLogThreshold(asRecord(readHarnessclawConfig({})).logging?.level))
-  logInfo('app.lifecycle', 'startup', '应用启动成功', {
-    currentStatus: '本地应用已完成初始化',
-    impact: '主界面与本地服务连接流程已开始工作',
-    suggestion: '当前无需处理',
+  logInfo('app.lifecycle', 'startup', 'Application startup completed', {
     runId: getCurrentRunId(),
+    currentStatus: 'Main process initialization has completed.',
+    impact: 'Window creation and local service startup can proceed.',
+    suggestion: 'No action is needed.',
   })
 
   process.on('uncaughtException', (error) => {
     logFailure(
       'app.lifecycle',
       'uncaughtException',
-      '应用发生未捕获异常',
+      'Unhandled exception in the main process',
       error.message,
-      '当前操作可能失败，部分功能可能不可用',
-      '请查看诊断日志并尝试重新启动应用',
-      { error },
+      'The current operation may fail and part of the app could become unstable.',
+      'Inspect the diagnostic logs and restart the app if instability continues.',
+      { error: { name: error.name, message: error.message, stack: error.stack } },
       true,
     )
   })
@@ -411,20 +469,24 @@ app.whenReady().then(() => {
     logFailure(
       'app.lifecycle',
       'unhandledRejection',
-      '应用发生未处理的异步异常',
+      'Unhandled promise rejection in the main process',
       reason instanceof Error ? reason.message : String(reason),
-      '当前操作可能失败，部分功能可能不可用',
-      '请查看诊断日志并尝试重新执行操作',
-      { reason },
+      'The current operation may fail and some features might not complete.',
+      'Inspect the diagnostic logs and retry the failed action.',
+      {
+        reason: reason instanceof Error
+          ? { name: reason.name, message: reason.message, stack: reason.stack }
+          : String(reason),
+      },
     )
   })
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
-    logInfo('app.lifecycle', 'window.created', '主窗口已创建', {
-      currentStatus: '桌面窗口已创建',
-      impact: '界面交互已就绪',
-      suggestion: '当前无需处理',
+    logInfo('app.lifecycle', 'window.created', 'Main window created', {
+      currentStatus: 'A browser window has been created.',
+      impact: 'The renderer can begin loading and user interaction becomes available.',
+      suggestion: 'No action is needed.',
     })
   })
 
@@ -448,10 +510,10 @@ app.whenReady().then(() => {
   // Config file read/write
   ipcMain.handle('config:read', () => {
     const config = readEngineConfig({ providers: {} })
-    logInfo('config', 'read', '已读取运行时配置', {
-      currentStatus: '当前配置已载入',
-      impact: '设置页显示的是最近一次保存的配置',
-      suggestion: '如需修改，可在设置页保存并应用',
+    logInfo('config', 'read', 'Read engine configuration', {
+      currentStatus: 'The latest engine config has been loaded from disk.',
+      impact: 'The settings view is showing the most recently saved values.',
+      suggestion: 'Review and save changes if updates are needed.',
     })
     return config
   })
@@ -460,20 +522,20 @@ app.whenReady().then(() => {
     ensureDir(HARNESSCLAW_DIR)
     const result = saveEngineConfig(data)
     if (result.ok) {
-      logInfo('config', 'save', '配置已保存：运行时配置已更新', {
-        currentStatus: '配置文件已写入本地磁盘',
-        impact: '下次应用或重启运行时会使用新配置',
-        suggestion: '如需立即生效，请执行应用配置或重启运行时',
+      logInfo('config', 'save', 'Saved engine configuration', {
+        currentStatus: 'Engine config has been written to disk.',
+        impact: 'The next runtime apply or restart will use the updated settings.',
+        suggestion: 'Apply or restart the runtime if the change should take effect immediately.',
       })
     } else {
       logFailure(
         'config',
         'save',
-        '配置保存失败：运行时配置未写入',
-        result.error || '未知错误',
-        '新配置不会生效，系统继续使用旧配置',
-        '请检查配置内容和本地目录写入权限',
-        { config: data },
+        'Failed to save engine configuration',
+        result.error || 'Unknown config save error.',
+        'The new runtime settings were not persisted and the previous config remains active.',
+        'Validate the config payload and local file permissions, then retry.',
+        { config: sanitizeForLogging(asRecord(data)) },
       )
     }
     return result
@@ -489,20 +551,20 @@ app.whenReady().then(() => {
     if (result.ok) {
       setLogThreshold(normalizeLogThreshold(asRecord(asRecord(data).logging).level))
       broadcastAppRuntimeStatus()
-      logInfo('config', 'apply', '配置已应用：本地运行时设置已更新', {
-        currentStatus: '最新配置已应用到本地应用',
-        impact: '日志级别和界面相关设置已生效',
-        suggestion: '如涉及运行时连接参数，可检查本地服务是否按预期重连',
+      logInfo('config', 'apply', 'Applied app configuration', {
+        currentStatus: 'Application settings have been updated.',
+        impact: 'Runtime status and logging preferences now reflect the new config.',
+        suggestion: 'If connection settings changed, confirm the runtime reconnects as expected.',
       })
     } else {
       logFailure(
         'config',
         'apply',
-        '配置应用失败：设置未生效',
-        result.error || '未知错误',
-        '应用继续使用旧设置',
-        '请检查配置内容并重试保存',
-        { config: data },
+        'Failed to apply app configuration',
+        result.error || 'Unknown app config save error.',
+        'The app continues using the previous settings.',
+        'Validate the config payload and retry saving the settings.',
+        { config: sanitizeForLogging(asRecord(data)) },
       )
     }
     return result
@@ -549,6 +611,7 @@ app.whenReady().then(() => {
       return { ok: false, cleared: [], error: String(error) }
     }
   })
+
   ipcMain.handle('app-runtime:logRenderer', (_, level: LogLevel, message: string, details?: Record<string, unknown>) => {
     writeRendererLog(level, message, details)
     return { ok: true }
@@ -569,93 +632,76 @@ app.whenReady().then(() => {
     }
   })
 
-  // Skills reader
+  // Skills reader and market
   ipcMain.handle('skills:list', () => {
-    try {
-      if (!existsSync(SKILLS_DIR)) return []
-      const dirs = readdirSync(SKILLS_DIR).filter((name) => {
-        const full = join(SKILLS_DIR, name)
-        return statSync(full).isDirectory() && existsSync(join(full, 'SKILL.md'))
-      })
-      return dirs.map((dirName) => {
-        const md = readFileSync(join(SKILLS_DIR, dirName, 'SKILL.md'), 'utf-8')
-        // Parse YAML frontmatter
-        const match = md.match(/^---\n([\s\S]*?)\n---/)
-        const meta: Record<string, string> = {}
-        if (match) {
-          match[1].split('\n').forEach((line) => {
-            const idx = line.indexOf(':')
-            if (idx > 0) {
-              meta[line.slice(0, idx).trim()] = line.slice(idx + 1).trim()
-            }
-          })
-        }
-        // Check for references and templates dirs
-        const hasRefs = existsSync(join(SKILLS_DIR, dirName, 'references'))
-        const hasTemplates = existsSync(join(SKILLS_DIR, dirName, 'templates'))
-        return {
-          id: dirName,
-          name: meta.name || dirName,
-          description: meta.description || '',
-          allowedTools: meta['allowed-tools'] || '',
-          hasReferences: hasRefs,
-          hasTemplates: hasTemplates,
-        }
-      })
-    } catch (err) {
-      console.error('[Skills] Failed to list:', err)
-      return []
-    }
+    return listInstalledSkills()
   })
 
   ipcMain.handle('skills:read', (_, id: string) => {
-    try {
-      const filePath = join(SKILLS_DIR, id, 'SKILL.md')
-      if (!existsSync(filePath)) return ''
-      return readFileSync(filePath, 'utf-8')
-    } catch (err) {
-      console.error('[Skills] Failed to read:', err)
-      return ''
-    }
+    return readInstalledSkill(id)
   })
 
   ipcMain.handle('skills:delete', (_, id: string) => {
-    try {
-      const trimmed = id.trim()
-      if (!trimmed || trimmed.includes('..') || trimmed.includes('/')) {
-        return { ok: false, error: 'Invalid skill id' }
-      }
-      const skillDir = join(SKILLS_DIR, trimmed)
-      if (!existsSync(skillDir)) {
-        return { ok: false, error: 'Skill not found' }
-      }
-      rmSync(skillDir, { recursive: true, force: true })
-      console.log('[Skills] Deleted:', trimmed)
-      return { ok: true }
-    } catch (err) {
-      console.error('[Skills] Failed to delete:', err)
-      return { ok: false, error: String(err) }
-    }
+    return deleteInstalledSkill(id)
+  })
+
+  ipcMain.handle('skills:listRepositories', () => {
+    return listSkillRepositories()
+  })
+
+  ipcMain.handle('skills:saveRepository', (_, input: {
+    id?: string
+    name?: string
+    repoUrl: string
+    branch?: string
+    basePath?: string
+    enabled?: boolean
+  }) => {
+    return saveSkillRepository(input)
+  })
+
+  ipcMain.handle('skills:removeRepository', (_, id: string) => {
+    return removeSkillRepository(id)
+  })
+
+  ipcMain.handle('skills:discover', (_, repositoryId?: string) => {
+    return discoverSkills(repositoryId)
+  })
+
+  ipcMain.handle('skills:listDiscovered', (_, repositoryId?: string) => {
+    return listDiscoveredSkills(repositoryId)
+  })
+
+  ipcMain.handle('skills:previewDiscovered', (_, repositoryId: string, skillPath: string) => {
+    return previewDiscoveredSkill(repositoryId, skillPath)
+      .catch((error) => {
+        console.error('[Skills] Failed to preview discovered skill:', error)
+        return ''
+      })
+  })
+
+  ipcMain.handle('skills:installDiscovered', (_, repositoryId: string, skillPath: string) => {
+    return installDiscoveredSkill(repositoryId, skillPath)
   })
 
   // Start bundled harnessclaw engine, then connect Harnessclaw (auto-retries until engine is ready)
   startHarnessclawEngine()
   try {
     getDb()
-    logInfo('storage.db', 'init', '本地数据库初始化成功', {
-      currentStatus: '会话与日志数据库已可用',
-      impact: '历史会话和统计数据可正常读写',
-      suggestion: '当前无需处理',
+    logInfo('storage.db', 'init', 'Database initialized successfully', {
+      currentStatus: 'Session and usage storage is ready.',
+      impact: 'History, usage tracking, and persisted metadata can be read and written.',
+      suggestion: 'No action is needed.',
     })
   } catch (error) {
     logFailure(
       'storage.db',
       'init',
-      '本地数据库初始化失败',
+      'Database initialization failed',
       error instanceof Error ? error.message : String(error),
-      '会话历史与统计数据可能无法保存',
-      '请检查本地磁盘权限与数据库文件状态',
-      { error },
+      'Sessions, history, or usage data may fail to persist.',
+      'Check local disk permissions and database file integrity.',
+      { error: error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : String(error) },
       true,
     )
     throw error
@@ -1067,10 +1113,10 @@ app.on('window-all-closed', () => {
 })
 
 app.on('will-quit', () => {
-  logInfo('app.lifecycle', 'quit', '应用正在退出', {
-    currentStatus: '应用退出流程进行中',
-    impact: '本地连接与窗口将关闭',
-    suggestion: '当前无需处理',
+  logInfo('app.lifecycle', 'quit', 'Application shutdown started', {
+    currentStatus: 'Shutdown cleanup is in progress.',
+    impact: 'Windows, runtime processes, and database handles will be closed.',
+    suggestion: 'No action is needed.',
   })
   harnessclawClient.disconnect()
   stopHarnessclawEngine()

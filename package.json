@@ -8,6 +8,7 @@
     "dev": "node scripts/electron-vite-runner.cjs dev",
     "dev:renderer": "vite --config vite.renderer.config.ts",
     "build": "electron-vite build",
+    "postinstall": "electron-builder install-app-deps",
     "rebuild:electron-native": "electron-builder install-app-deps",
     "bundle:tools": "node scripts/build-bundled-tools.cjs",
     "dist": "yarn build && electron-builder --config electron-builder.config.cjs --publish never",

@@ -3,12 +3,11 @@ import { useLocation } from 'react-router-dom'
 import {
   Send, Plus, ChevronLeft, ChevronRight, Copy, Check, Trash2,
   Loader2, Wrench, Brain, AlertCircle, RefreshCw, ChevronDown, ChevronUp,
-  Paperclip, FileText, X
+  FileText, X, ArrowDown
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { cn } from '@/lib/utils'
-import { HarnessclawStatusBadge } from '../common/HarnessclawStatusBadge'
 import {
   AttachmentPreviewPanel,
   type LocalAttachmentItem,
@@ -247,6 +246,39 @@ function parsePermissionResultData(raw: string): PermissionResultData | null {
   }
 }
 
+function getConversationLabel(title = '', firstMessage = ''): string {
+  const raw = title.trim() || firstMessage.trim() || '新对话'
+  return raw.length > 24 ? `${raw.slice(0, 24)}...` : raw
+}
+
+function getToolDisplayName(name?: string): string {
+  const toolLabels: Record<string, string> = {
+    read_file: '读取文件',
+    write_file: '写入文件',
+    search_query: '在线搜索',
+    open: '打开页面',
+    click: '点击页面元素',
+    find: '查找页面内容',
+    screenshot: '查看 PDF 页面',
+    image_query: '查找图片',
+    weather: '查询天气',
+    sports: '查询赛事',
+    finance: '查询价格',
+    time: '查询时间',
+  }
+
+  if (!name) return '工具操作'
+  return toolLabels[name] || name.replace(/_/g, ' ')
+}
+
+function getPermissionOptionLabel(label: string): string {
+  const normalized = label.trim().toLowerCase()
+  if (normalized === 'allow once') return '允许这一次'
+  if (normalized === 'always allow in this session') return '本次会话都允许'
+  if (normalized === 'deny') return '拒绝'
+  return label
+}
+
 // ─── Chat Page ──────────────────────────────────────────────────────────────
 
 export function ChatPage() {
@@ -259,11 +291,14 @@ export function ChatPage() {
   const [input, setInput] = useState(initialMessage)
   const [attachments, setAttachments] = useState<AttachmentItem[]>(initialAttachments)
   const [isDragOver, setIsDragOver] = useState(false)
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
   const [harnessclawStatus, setHarnessclawStatus] = useState<HarnessclawStatus>('disconnected')
-  const [clientId, setClientId] = useState('')
   const [sessions, setSessions] = useState<SessionItem[]>([])
+  const messagesViewportRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null)
+  const isNearBottomRef = useRef(true)
   const pendingInitialTurn = useRef<{ content: string; attachments: AttachmentItem[] } | null>(
     initialMessage || initialAttachments.length > 0
       ? { content: initialMessage, attachments: initialAttachments }
@@ -334,15 +369,12 @@ export function ChatPage() {
 
   const respondPermission = useCallback(async (requestId: string, approved: boolean, scope: 'once' | 'session') => {
     if (!requestId) return
-    const response = await window.harnessclaw.respondPermission(
+    await window.harnessclaw.respondPermission(
       requestId,
       approved,
       scope,
       approved ? undefined : 'User denied permission request'
     )
-    if (!response.ok) {
-      console.error('[ChatPage] Failed to respond permission:', response.error)
-    }
   }, [])
 
   const activeSession = getSession(activeSessionId)
@@ -357,14 +389,102 @@ export function ChatPage() {
       const msgCount = localState?.messages.filter((m) => m.role !== 'system').length || 0
       const firstMsg = localState?.messages.find((m) => m.role === 'user')?.content || ''
       const title = dbInfo?.title || ''
-      return { key, updatedAt: serverInfo?.updatedAt, msgCount, firstMsg, title }
+      return {
+        key,
+        updatedAt: serverInfo?.updatedAt,
+        msgCount,
+        firstMsg,
+        title,
+        label: getConversationLabel(title, firstMsg),
+      }
     })
   }, [sessionMap, sessions, dbSessions])
+  const activeSessionMeta = displayedSessions.find((session) => session.key === activeSessionId)
+  const activeSessionLabel = activeSessionMeta?.label || '新对话'
+  const resizeComposerTextarea = useCallback(() => {
+    const textarea = composerTextareaRef.current
+    if (!textarea) return
 
-  // Scroll to bottom
+    const lineHeight = 24
+    const maxHeight = lineHeight * 5
+    textarea.style.height = '0px'
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight)
+    textarea.style.height = `${nextHeight}px`
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
+  }, [])
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [activeSession.messages, activeSession.currentThinking])
+    resizeComposerTextarea()
+  }, [input, resizeComposerTextarea])
+
+  const composerNotice = useMemo(() => {
+    if (activeSession.isStopping) {
+      return {
+        tone: 'danger' as const,
+        title: '正在停止当前任务',
+        description: '已经发出停止请求。任务结束后，你就可以继续输入新内容。',
+        actionLabel: null,
+      }
+    }
+
+    if (activeSession.isPaused) {
+      return {
+        tone: 'warning' as const,
+        title: '需要你确认后继续',
+        description: 'Agent 想执行一个可能影响文件或环境的操作。处理下方授权后，会自动继续。',
+        actionLabel: null,
+      }
+    }
+
+    if (harnessclawStatus === 'connecting') {
+      return {
+        tone: 'warning' as const,
+        title: '正在连接 HarnessClaw',
+        description: '你可以先整理问题；连接恢复后就能继续发送。',
+        actionLabel: '重新连接',
+      }
+    }
+
+    if (harnessclawStatus !== 'connected') {
+      return {
+        tone: 'warning' as const,
+        title: '当前还没有连接到 HarnessClaw',
+        description: '发送时会自动尝试连接。若想立即恢复，也可以手动重试。',
+        actionLabel: '重新连接',
+      }
+    }
+
+    return null
+  }, [activeSession.isPaused, activeSession.isStopping, harnessclawStatus])
+
+  const updateScrollState = useCallback(() => {
+    const viewport = messagesViewportRef.current
+    if (!viewport) return
+
+    const distanceToBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
+    const threshold = Math.max(120, viewport.clientHeight * 0.382)
+    const isNearBottom = distanceToBottom <= threshold
+
+    isNearBottomRef.current = isNearBottom
+    setShowJumpToBottom(!isNearBottom)
+  }, [])
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior })
+    isNearBottomRef.current = true
+    setShowJumpToBottom(false)
+  }, [])
+
+  // Scroll to bottom only when the user is already close to the bottom
+  useEffect(() => {
+    if (isNearBottomRef.current) {
+      scrollToBottom('smooth')
+    }
+  }, [activeSession.messages, activeSession.currentThinking, scrollToBottom])
+
+  useEffect(() => {
+    scrollToBottom('auto')
+  }, [activeSessionId, scrollToBottom])
 
   useEffect(() => {
     const preventWindowDrop = (event: DragEvent) => {
@@ -457,7 +577,6 @@ export function ChatPage() {
 
     window.harnessclaw.getStatus().then((s) => {
       setHarnessclawStatus(s.status as HarnessclawStatus)
-      if (s.clientId) setClientId(s.clientId)
     })
 
     // Request session list
@@ -482,7 +601,6 @@ export function ChatPage() {
     const type = event.type as string
     const eventSessionId = event.session_id as string | undefined
     const subagent = normalizeSubagent(event.subagent)
-    console.log('[ChatPage] event:', type, 'session_id:', eventSessionId, 'activeRef:', activeSessionIdRef.current)
 
     const ensureAssistantMessage = (sid: string, now: number): string => {
       let aid = pendingAssistantIds.current[sid]
@@ -509,8 +627,6 @@ export function ChatPage() {
 
     switch (type) {
       case 'connected': {
-        const cid = event.client_id as string
-        setClientId(cid)
         setHarnessclawStatus('connected')
         // Don't auto-set activeSessionId — user creates/selects sessions manually
         window.harnessclaw.listSessions()
@@ -922,13 +1038,12 @@ export function ChatPage() {
         break
 
       default:
-        console.log('[Harnessclaw event]', type, JSON.stringify(event))
+        break
     }
   }, [updateSession])
 
   const handleSend = () => {
     const message = input.trim()
-    console.log('[ChatPage] handleSend activeSessionId:', activeSessionId, 'input:', message.slice(0, 20))
     if ((!message && attachments.length === 0) || activeSession.isProcessing) return
 
     const sid = activeSessionId || ensureLocalSession()
@@ -1096,55 +1211,54 @@ export function ChatPage() {
   }, [])
 
   return (
-    <div className="relative flex h-full overflow-hidden">
+    <div className="relative flex h-full overflow-hidden bg-background">
       {/* Left: Session sidebar */}
       {showSidebar && (
-        <div className="w-60 flex-shrink-0 border-r border-border bg-card flex flex-col">
-          <div className="p-3 border-b border-border">
+        <aside className="flex w-64 flex-shrink-0 flex-col border-r border-border/80 bg-card">
+          <div className="border-b border-border/80 px-3 py-3">
             <button
               onClick={handleNewSession}
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-lg bg-[#1A1A1A] text-white hover:bg-[#333333] transition-colors"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-foreground px-3 py-2.5 text-sm font-medium text-background transition-opacity hover:opacity-90 dark:bg-primary dark:text-primary-foreground"
             >
               <Plus size={14} />
-              新建会话
+              开始新对话
             </button>
           </div>
 
           {/* Session list */}
-          <div className="flex-1 overflow-y-auto p-2">
+          <div className="flex-1 overflow-y-auto px-2 py-3">
             {displayedSessions.length === 0 ? (
-              <div className="text-xs text-muted-foreground text-center py-4">暂无会话记录</div>
+              <div className="px-3 py-6 text-center">
+                <p className="text-sm text-foreground">还没有对话记录</p>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  新建一个会话后，历史记录会出现在这里。
+                </p>
+              </div>
             ) : (
               displayedSessions.map((s) => {
                 const isActive = s.key === activeSessionId
-                const label = s.title
-                  ? s.title.length > 20 ? s.title.slice(0, 20) + '...' : s.title
-                  : s.firstMsg
-                    ? s.firstMsg.length > 20 ? s.firstMsg.slice(0, 20) + '...' : s.firstMsg
-                    : '新建会话'
                 return (
                   <div
                     key={s.key}
                     className={cn(
-                      'group/item w-full text-left px-3 py-2.5 rounded-lg transition-colors mb-1 flex items-start justify-between cursor-pointer',
-                      isActive ? 'bg-accent text-foreground' : 'hover:bg-muted text-foreground'
+                      'group/item mb-1.5 flex w-full cursor-pointer items-start justify-between rounded-2xl px-3 py-3 text-left transition-all',
+                      isActive
+                        ? 'bg-accent text-foreground shadow-sm ring-1 ring-border/80'
+                        : 'text-foreground hover:bg-muted/70'
                     )}
                     onClick={() => handleSwitchSession(s.key)}
                   >
                     <div className="flex-1 min-w-0">
-                      <span className="text-xs font-medium truncate block">{label}</span>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        {s.updatedAt && (
-                          <span className="text-[10px] text-muted-foreground">{s.updatedAt}</span>
-                        )}
-                        {s.msgCount > 0 && (
-                          <span className="text-[10px] text-muted-foreground">{s.msgCount} 条</span>
-                        )}
-                      </div>
+                      <span className="block truncate text-sm font-medium">{s.label}</span>
+                      <p className="mt-1 text-[11px] leading-5 text-foreground/62 dark:text-foreground/78">
+                        {s.updatedAt || '刚刚更新'}
+                        {s.msgCount > 0 ? ` · ${s.msgCount} 条消息` : ''}
+                      </p>
                     </div>
                     <button
                       onClick={(e) => { e.stopPropagation(); handleDeleteSession(s.key) }}
-                      className="opacity-0 group-hover/item:opacity-100 p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 transition-all flex-shrink-0"
+                      className="ml-2 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl opacity-0 transition-all hover:bg-red-100 group-hover/item:opacity-100 dark:hover:bg-red-900/30"
+                      aria-label={`删除会话 ${s.label}`}
                     >
                       <Trash2 size={12} className="text-muted-foreground hover:text-red-500" />
                     </button>
@@ -1153,34 +1267,41 @@ export function ChatPage() {
               })
             )}
           </div>
-        </div>
+        </aside>
       )}
 
       {/* Main chat area */}
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div className="relative flex-1 flex min-w-0 flex-col overflow-hidden">
         {/* Top bar */}
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-card/80 backdrop-blur-sm">
-          <div className="flex items-center gap-2">
-            <button onClick={() => setShowSidebar(!showSidebar)} className="p-1 rounded hover:bg-muted transition-colors">
+        <div className="titlebar-drag border-b border-border/80 bg-card/72 px-4 py-3 backdrop-blur-sm">
+          <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <button
+                onClick={() => setShowSidebar(!showSidebar)}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-background transition-colors hover:bg-muted"
+                aria-label={showSidebar ? '收起会话列表' : '展开会话列表'}
+              >
               {showSidebar ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
-            </button>
-            <span className="text-base">🤖</span>
-            <span className="text-sm font-medium">Harnessclaw</span>
-            {activeSessionId && <span className="text-[10px] text-muted-foreground font-mono truncate max-w-[200px]">{activeSessionId}</span>}
-            {activeSession.isStopping ? (
-              <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300">
-                中止中
-              </span>
-            ) : activeSession.isPaused && (
-              <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
-                已暂停
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            <HarnessclawStatusBadge />
+              </button>
+
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-foreground">Agent Console</span>
+                  <span className="rounded-full border border-border bg-background px-2 py-0.5 text-[10px] text-muted-foreground">
+                    观察中
+                  </span>
+                </div>
+                <p className="truncate text-xs text-muted-foreground">
+                  {activeSessionId ? activeSessionLabel : '先开始一个对话，Agent 的过程会显示在这里。'}
+                </p>
+              </div>
+            </div>
+
             {activeSessionId && (
-              <button onClick={handleClearHistory} className="text-xs text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1">
+              <button
+                onClick={handleClearHistory}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border px-3 py-2 text-xs text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
+              >
                 <Trash2 size={12} />
                 清空历史
               </button>
@@ -1190,178 +1311,199 @@ export function ChatPage() {
 
         {!activeSessionId ? (
           /* Empty state — no session selected */
-          <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground">
-            <span className="text-4xl mb-4">🤖</span>
-            <p className="text-sm mb-1">请选择一个会话或新建会话开始对话</p>
-            <button
-              onClick={handleNewSession}
-              className="mt-3 flex items-center gap-2 px-4 py-2 text-sm rounded-lg bg-[#1A1A1A] text-white hover:bg-[#333333] transition-colors"
-            >
-              <Plus size={14} />
-              新建会话
-            </button>
+          <div className="flex flex-1 items-center justify-center px-6">
+            <div className="w-full max-w-md text-center">
+              <button
+                onClick={handleNewSession}
+                className="inline-flex items-center gap-2 rounded-full bg-foreground px-4 py-2.5 text-sm font-medium text-background transition-opacity hover:opacity-90 dark:bg-primary dark:text-primary-foreground"
+              >
+                <Plus size={14} />
+                开始新对话
+              </button>
+            </div>
           </div>
         ) : (
           <>
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-              {activeSession.messages.map((message) => (
-                <MessageBubble
-                  key={message.id}
-                  message={message}
-                  onOpenFilePreview={setFilePreview}
-                  onRespondPermission={respondPermission}
-                />
-              ))}
+            <div
+              ref={messagesViewportRef}
+              onScroll={updateScrollState}
+              className="flex-1 overflow-y-auto px-4 py-5"
+            >
+              <div className="mx-auto flex w-full max-w-4xl flex-col gap-5">
+                {activeSession.messages.map((message) => (
+                  <MessageBubble
+                    key={message.id}
+                    message={message}
+                    onOpenFilePreview={setFilePreview}
+                    onRespondPermission={respondPermission}
+                  />
+                ))}
 
-              {/* Live thinking indicator */}
-              {activeSession.isProcessing && activeSession.currentThinking && (
-                <ThinkingIndicator content={activeSession.currentThinking} />
-              )}
+                {/* Live thinking indicator */}
+                {activeSession.isProcessing && activeSession.currentThinking && (
+                  <ThinkingIndicator content={activeSession.currentThinking} />
+                )}
 
-              {activeSession.isPaused && (
-                <div className="flex justify-start">
-                  <div className="max-w-[80%] rounded-2xl rounded-bl-sm border border-amber-200 bg-amber-50 px-3.5 py-2.5 shadow-sm dark:border-amber-900/40 dark:bg-amber-950/20">
-                    <div className="flex items-center gap-2">
-                      <AlertCircle size={12} className="text-amber-600 dark:text-amber-300" />
-                      <span className="text-xs font-medium text-amber-800 dark:text-amber-200">会话已暂停，等待授权</span>
-                    </div>
-                    {activeSession.pauseReason && (
-                      <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">{activeSession.pauseReason}</p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {activeSession.isStopping && (
-                <div className="flex justify-start">
-                  <div className="max-w-[80%] rounded-2xl rounded-bl-sm border border-red-200 bg-red-50 px-3.5 py-2.5 shadow-sm dark:border-red-900/40 dark:bg-red-950/20">
-                    <div className="flex items-center gap-2">
-                      <Loader2 size={12} className="animate-spin text-red-600 dark:text-red-300" />
-                      <span className="text-xs font-medium text-red-800 dark:text-red-200">正在中止会话</span>
-                    </div>
-                    {activeSession.pauseReason && (
-                      <p className="mt-1 text-[11px] text-red-700 dark:text-red-300">{activeSession.pauseReason}</p>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Processing spinner — visible until assistant message has text content */}
-              {activeSession.isProcessing && !activeSession.isPaused && !activeSession.isStopping && !activeSession.currentThinking && (
-                (() => {
-                  const aid = pendingAssistantIds.current[activeSessionId]
-                  const pending = aid ? activeSession.messages.find((m) => m.id === aid) : null
-                  // Hide spinner once assistant message has text content or tools
-                  if (pending?.content) return null
-                  if (pending?.tools && pending.tools.length > 0) return null
-                  return (
-                    <div className="flex justify-start">
-                      <div className="px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-card border border-border shadow-sm flex items-center gap-2">
-                        <Loader2 size={14} className="animate-spin text-muted-foreground" />
-                        <span className="text-sm text-muted-foreground">思考中...</span>
+                {/* Processing spinner — visible until assistant message has text content */}
+                {activeSession.isProcessing && !activeSession.isPaused && !activeSession.isStopping && !activeSession.currentThinking && (
+                  (() => {
+                    const aid = pendingAssistantIds.current[activeSessionId]
+                    const pending = aid ? activeSession.messages.find((m) => m.id === aid) : null
+                    if (pending?.content) return null
+                    if (pending?.tools && pending.tools.length > 0) return null
+                    return (
+                      <div className="flex justify-start">
+                        <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-border bg-card px-3.5 py-2.5 shadow-sm">
+                          <Loader2 size={14} className="animate-spin text-muted-foreground" />
+                          <span className="text-sm text-muted-foreground">Agent 正在准备回复…</span>
+                        </div>
                       </div>
-                    </div>
-                  )
-                })()
-              )}
+                    )
+                  })()
+                )}
 
-              <div ref={messagesEndRef} />
+                <div ref={messagesEndRef} />
+              </div>
             </div>
 
-            {/* Input area */}
-            <div className="p-4 border-t border-border">
-              {harnessclawStatus !== 'connected' && (
-                <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800">
-                  <AlertCircle size={14} className="text-yellow-600 dark:text-yellow-400 flex-shrink-0" />
-                  <span className="text-xs text-yellow-700 dark:text-yellow-300">
-                    当前未完成探活，发送消息时会先尝试重连并初始化会话
-                  </span>
-                  <button onClick={handleReconnect} className="text-xs font-medium text-yellow-700 dark:text-yellow-300 hover:underline flex-shrink-0">
-                    重试
-                  </button>
-                </div>
-              )}
-              {activeSession.isPaused && (
-                <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-900/40 dark:bg-amber-950/20">
-                  <AlertCircle size={14} className="text-amber-600 dark:text-amber-300 flex-shrink-0" />
-                  <span className="text-xs text-amber-800 dark:text-amber-200">
-                    当前 query-loop 已暂停，等待你处理权限审批。处理完成后会自动继续。
-                  </span>
-                </div>
-              )}
-              {activeSession.isStopping && (
-                <div className="mb-3 flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 dark:border-red-900/40 dark:bg-red-950/20">
-                  <Loader2 size={14} className="animate-spin text-red-600 dark:text-red-300 flex-shrink-0" />
-                  <span className="text-xs text-red-800 dark:text-red-200">
-                    已发送中止请求，等待服务端返回 `task.end(status: "aborted")`。
-                  </span>
-                </div>
-              )}
-              <div
-                className={cn(
-                  'relative rounded-2xl border overflow-hidden shadow-sm bg-card transition-[border-color,box-shadow]',
-                  isDragOver ? 'border-primary shadow-[0_0_0_3px_rgba(37,99,235,0.16)]' : 'border-border'
-                )}
-                onDragOver={handleDragOver}
-                onDragEnter={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
+            {showJumpToBottom && (
+              <button
+                onClick={() => scrollToBottom('smooth')}
+                className="absolute bottom-[calc(100px+1.5rem)] left-1/2 z-20 flex h-11 w-11 -translate-x-1/2 items-center justify-center rounded-full border border-border/80 bg-white shadow-[0_14px_30px_rgba(15,23,42,0.14)] transition-transform hover:scale-[1.03] dark:bg-card"
+                aria-label="快速回到底部"
+                title="回到底部"
               >
-                {isDragOver && (
-                  <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/5 text-sm text-primary">
-                    松开即可添加文件
+                <ArrowDown size={18} className="text-foreground" />
+              </button>
+            )}
+
+            {/* Input area */}
+            <div className="border-t border-border/80 bg-card/45 px-4 py-2.5 backdrop-blur-sm">
+              <div className="mx-auto w-full max-w-4xl">
+                {composerNotice && (
+                  <div
+                    className={cn(
+                      'mb-3 flex items-start gap-2 rounded-2xl border px-3.5 py-3',
+                      composerNotice.tone === 'danger'
+                        ? 'border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-950/20'
+                        : 'border-amber-200 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-950/20'
+                    )}
+                  >
+                    {composerNotice.tone === 'danger' ? (
+                      <Loader2 size={14} className="mt-0.5 flex-shrink-0 animate-spin text-red-600 dark:text-red-300" />
+                    ) : (
+                      <AlertCircle size={14} className="mt-0.5 flex-shrink-0 text-amber-600 dark:text-amber-300" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <p
+                        className={cn(
+                          'text-xs font-medium',
+                          composerNotice.tone === 'danger'
+                            ? 'text-red-800 dark:text-red-200'
+                            : 'text-amber-800 dark:text-amber-200'
+                        )}
+                      >
+                        {composerNotice.title}
+                      </p>
+                      <p
+                        className={cn(
+                          'mt-1 text-xs leading-5',
+                          composerNotice.tone === 'danger'
+                            ? 'text-red-700 dark:text-red-300'
+                            : 'text-amber-700 dark:text-amber-300'
+                        )}
+                      >
+                        {composerNotice.description}
+                      </p>
+                    </div>
+                    {composerNotice.actionLabel && (
+                      <button
+                        onClick={handleReconnect}
+                        className={cn(
+                          'inline-flex flex-shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-opacity hover:opacity-80',
+                          composerNotice.tone === 'danger'
+                            ? 'border-red-300 text-red-700 dark:border-red-800 dark:text-red-300'
+                            : 'border-amber-300 text-amber-700 dark:border-amber-800 dark:text-amber-300'
+                        )}
+                      >
+                        <RefreshCw size={12} />
+                        {composerNotice.actionLabel}
+                      </button>
+                    )}
                   </div>
                 )}
-                <div className="p-3">
-                  <textarea
-                    value={input}
-                    onChange={(e) => setInput(e.target.value.slice(0, maxLength))}
-                    onKeyDown={handleKeyDown}
-                    disabled={activeSession.isProcessing}
-                    placeholder={harnessclawStatus === 'connected' ? '+ 有问题，尽管问' : '+ 有问题，尽管问，发送时会自动连接'}
-                    className="w-full bg-transparent resize-none outline-none text-sm text-foreground placeholder:text-muted-foreground min-h-[60px] max-h-[150px] disabled:opacity-50"
-                    rows={2}
-                  />
-                  <AttachmentPreviewPanel
-                    attachments={attachments}
-                    onRemove={handleRemoveAttachment}
-                    removable={!activeSession.isProcessing}
-                  />
-                  <div className="mt-3 flex items-center gap-2">
-                    <button
-                      onClick={handlePickFiles}
-                      disabled={activeSession.isProcessing || harnessclawStatus !== 'connected'}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50"
-                      title="选择本地文件"
-                    >
-                      <Paperclip size={12} />
-                      <span>添加文件</span>
-                    </button>
-                    <span className="text-xs text-muted-foreground">也可直接拖拽文件到输入框</span>
-                  </div>
-                  <div className="flex items-center justify-between mt-1">
-                    <span className="text-xs text-muted-foreground">Cmd + Enter 发送</span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground">{input.length}/{maxLength}</span>
-                      {activeSession.isProcessing ? (
-                        <button
-                          onClick={handleStop}
-                          disabled={activeSession.isStopping}
-                          className="w-7 h-7 rounded-lg bg-red-500 hover:bg-red-600 flex items-center justify-center transition-colors"
-                          title="终止对话"
-                        >
-                          <span className="w-3 h-3 bg-white rounded-sm" />
-                        </button>
-                      ) : (
-                        <button
-                          onClick={handleSend}
-                          disabled={!input.trim() && attachments.length === 0}
-                          className="w-7 h-7 rounded-lg bg-[#555555] disabled:bg-[#C4C4C4] flex items-center justify-center transition-colors hover:bg-[#444444]"
-                        >
-                          <Send size={13} className="text-white" />
-                        </button>
-                      )}
+
+                <div
+                  className={cn(
+                    'relative overflow-hidden rounded-[28px] border bg-card shadow-[0_12px_36px_rgba(15,23,42,0.04)] transition-[border-color,box-shadow]',
+                    isDragOver
+                      ? 'border-primary shadow-[0_18px_50px_rgba(37,99,235,0.14)]'
+                      : 'border-border focus-within:border-primary'
+                  )}
+                  onDragOver={handleDragOver}
+                  onDragEnter={handleDragOver}
+                  onDragLeave={handleDragLeave}
+                  onDrop={handleDrop}
+                >
+                  {isDragOver && (
+                    <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-card text-sm text-primary">
+                      松开即可添加文件
+                    </div>
+                  )}
+                  <div className="p-3 sm:p-3.5">
+                    <textarea
+                      ref={composerTextareaRef}
+                      value={input}
+                      onChange={(e) => setInput(e.target.value.slice(0, maxLength))}
+                      onKeyDown={handleKeyDown}
+                      disabled={activeSession.isProcessing}
+                      placeholder={
+                        harnessclawStatus === 'connected'
+                          ? '+ 想让 HarnessClaw 帮你做什么？'
+                          : '+ 先写下你的问题，发送时会自动尝试连接。'
+                      }
+                      className="min-h-[26px] max-h-[120px] w-full resize-none bg-transparent text-[15px] leading-6 text-foreground outline-none placeholder:text-muted-foreground disabled:opacity-50"
+                      rows={1}
+                    />
+                    <AttachmentPreviewPanel
+                      attachments={attachments}
+                      onRemove={handleRemoveAttachment}
+                      removable={!activeSession.isProcessing}
+                    />
+                    <div className="mt-2 flex items-center justify-between gap-3">
+                      <button
+                        onClick={handlePickFiles}
+                        disabled={activeSession.isProcessing || harnessclawStatus !== 'connected'}
+                        className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:border-primary hover:text-foreground disabled:opacity-50"
+                        title="添加文件"
+                        aria-label="添加文件"
+                      >
+                        <Plus size={16} />
+                      </button>
+
+                      <div className="flex items-center gap-2">
+                        {activeSession.isProcessing ? (
+                          <button
+                            onClick={handleStop}
+                            disabled={activeSession.isStopping}
+                            className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-red-200 bg-red-50 text-red-700 transition-colors hover:bg-red-100 disabled:opacity-60 dark:border-red-900/40 dark:bg-red-950/20 dark:text-red-300"
+                            title="停止当前任务"
+                            aria-label="停止当前任务"
+                          >
+                            <span className="h-2 w-2 rounded-sm bg-current" />
+                          </button>
+                        ) : (
+                          <button
+                            onClick={handleSend}
+                            disabled={!input.trim() && attachments.length === 0}
+                            className="inline-flex h-9 w-9 items-center justify-center rounded-full bg-foreground text-background transition-opacity hover:opacity-90 disabled:opacity-50 dark:bg-primary dark:text-primary-foreground"
+                            aria-label="发送消息"
+                          >
+                            <Send size={14} aria-hidden="true" />
+                          </button>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1522,19 +1664,19 @@ function MessageBubble({
       className={cn(
         compact
           ? 'mb-1.5 rounded-xl bg-transparent px-0 py-0 text-[13px]'
-          : 'px-3.5 py-2.5 rounded-2xl text-sm mb-1.5',
+          : 'mb-1.5 rounded-2xl px-3.5 py-2.5 text-sm',
         !compact && isUser
-          ? 'bg-[#555555] text-white rounded-br-sm'
+          ? 'rounded-br-sm bg-foreground text-background dark:bg-primary dark:text-primary-foreground'
           : !compact
-            ? 'bg-card border border-border text-foreground rounded-bl-sm shadow-sm'
-            : 'text-foreground'
+            ? 'w-full rounded-bl-sm border border-border bg-card text-foreground shadow-sm dark:border-[#2b3245] dark:bg-[#161b27] dark:text-[#e8edf5]'
+            : 'text-foreground dark:text-[#dce3ef]'
       )}
     >
       {isUser ? (
         <p className="whitespace-pre-wrap">{text}</p>
       ) : (
         <div className={cn(
-          'prose max-w-none prose-pre:bg-muted prose-pre:border prose-pre:border-border prose-code:text-foreground prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs',
+          'prose max-w-none text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-li:text-foreground prose-a:text-primary prose-blockquote:border-l-border prose-blockquote:text-muted-foreground prose-pre:border prose-pre:border-border prose-pre:bg-muted prose-pre:text-foreground prose-code:rounded prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-foreground dark:prose-invert dark:text-[#dce3ef] dark:prose-headings:text-[#eef3fb] dark:prose-p:text-[#dce3ef] dark:prose-strong:text-[#f5f8fe] dark:prose-li:text-[#dce3ef] dark:prose-a:text-[#8cb8ff] dark:prose-blockquote:border-l-[#374057] dark:prose-blockquote:text-[#aab4c7] dark:prose-pre:border-[#2a3246] dark:prose-pre:bg-[#111623] dark:prose-pre:text-[#e6edf8] dark:prose-code:bg-[#20283a] dark:prose-code:text-[#f2f6ff]',
           compact ? 'prose-xs' : 'prose-sm'
         )}>
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
@@ -1547,33 +1689,44 @@ function MessageBubble({
     <div
       key={key}
       className={cn(
-        'flex items-center gap-1.5',
-        compact ? 'mb-1.5 rounded-lg bg-accent/55 px-2 py-1.5' : 'mb-1.5 px-3 py-1'
+        'mb-1.5 flex items-center gap-1.5',
+        compact
+          ? 'rounded-lg bg-accent/55 px-2 py-1.5 dark:bg-[#1a2131]'
+          : 'rounded-full bg-accent/45 px-2.5 py-1 dark:bg-[#1a2131]'
       )}
     >
-      <Wrench size={10} className="text-muted-foreground" />
-      <span className={cn(compact ? 'text-[11px] text-foreground/80' : 'text-[11px] text-muted-foreground')}>{text}</span>
+      <Wrench size={10} className="text-muted-foreground dark:text-[#a9b3c6]" />
+      <span className={cn(
+        compact
+          ? 'text-[11px] text-foreground/80 dark:text-[#d4dceb]'
+          : 'text-[11px] text-muted-foreground dark:text-[#a9b3c6]'
+      )}>{text}</span>
     </div>
   )
 
   const renderStatus = (text: string, key: string, status?: string) => (
-    <div key={key} className="mb-2 flex items-center gap-2 rounded-xl border border-border/70 bg-background/75 px-2.5 py-2">
+    <div key={key} className="mb-2 flex items-center gap-2 rounded-xl border border-border/70 bg-background/75 px-2.5 py-2 dark:border-[#2a3145] dark:bg-[#131926]">
       <span className={cn(
         'inline-block h-2.5 w-2.5 rounded-sm',
         status === 'error' ? 'bg-red-500' : status === 'running' ? 'bg-amber-500' : 'bg-emerald-500'
       )} />
-      <span className="text-[11px] text-muted-foreground">{text}</span>
+      <span className="text-[11px] text-muted-foreground dark:text-[#aeb7ca]">{text}</span>
     </div>
   )
 
   return (
     <div className={cn('flex group', isUser ? 'justify-end' : 'justify-start')}>
-      <div className={cn('max-w-[80%] relative', isUser ? 'items-end' : 'items-start')}>
+      <div
+        className={cn(
+          'relative',
+          isUser ? 'max-w-[80%] items-end' : 'w-[min(80%,56rem)] items-start'
+        )}
+      >
         <div className={cn(
-          'absolute top-1 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1',
+          'absolute top-1 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100',
           isUser ? '-left-16' : '-right-16'
         )}>
-          <button onClick={handleCopy} className="p-1 rounded hover:bg-muted">
+          <button onClick={handleCopy} className="rounded-lg p-1.5 hover:bg-muted" aria-label="复制消息">
             {copied ? <Check size={12} className="text-green-500" /> : <Copy size={12} className="text-muted-foreground" />}
           </button>
         </div>
@@ -1650,21 +1803,16 @@ function MessageBubble({
             {new Date(message.timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
           </p>
           {toolCalls.length > 0 && (
-            <span className="text-[10px] text-muted-foreground flex items-center gap-0.5">
-              <Wrench size={9} /> {toolCalls.length} tools
+            <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+              <Wrench size={9} /> {toolCalls.length} 个工具操作
             </span>
           )}
           {subagentCount > 0 && (
-            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+            <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
               <span className="inline-flex h-3.5 w-3.5 items-center justify-center rounded-[4px] border border-border bg-accent">
                 <span className="h-1.5 w-1.5 rounded-[2px] bg-primary" />
               </span>
-              {subagentCount} subagents
-            </span>
-          )}
-          {message.usage && (
-            <span className="text-[10px] text-muted-foreground">
-              {message.usage.total_tokens} tokens
+              {subagentCount} 个辅助处理
             </span>
           )}
         </div>
@@ -1687,7 +1835,7 @@ function PixelSubagentIcon({ status }: { status: string }) {
   const tone = status === 'error' ? 'bg-red-500' : 'bg-primary'
 
   return (
-    <div className="grid grid-cols-8 gap-[1px] rounded-md bg-card/80 p-1 shadow-inner">
+    <div className="grid grid-cols-8 gap-[1px] rounded-md bg-card/80 p-1 shadow-inner dark:bg-[#111623]">
       {pixels.flatMap((row, rowIndex) =>
         row.split('').map((cell, colIndex) => (
           <span
@@ -1731,17 +1879,17 @@ function SubagentPanel({
   }, [isRunning])
 
   return (
-    <section className="mb-3 ml-4 rounded-[1.35rem] border border-border bg-[linear-gradient(180deg,rgba(37,99,235,0.10),rgba(37,99,235,0.03))] shadow-[0_14px_30px_rgba(15,23,42,0.08)]">
+    <section className="mb-3 ml-4 overflow-hidden rounded-[1.35rem] border border-border/80 bg-card/85 shadow-[0_10px_26px_rgba(15,23,42,0.06)] dark:border-[#2b3246] dark:bg-[#161c29] dark:shadow-[0_14px_32px_rgba(0,0,0,0.22)]">
       <button
         onClick={() => setExpanded((prev) => !prev)}
-        className="flex w-full items-center gap-3 px-3.5 py-3 text-left transition-colors hover:bg-white/20 dark:hover:bg-white/5"
+        className="flex w-full items-center gap-3 px-3.5 py-3 text-left transition-colors hover:bg-muted/40 dark:hover:bg-[#1b2332]"
       >
-        <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl border border-border bg-card shadow-sm">
+        <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl border border-border bg-card shadow-sm dark:border-[#2b3246] dark:bg-[#151b27]">
           <PixelSubagentIcon status={latestTask.status} />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-semibold text-foreground">{latestTask.label}</span>
+            <span className="truncate text-sm font-semibold text-foreground">辅助处理 · {latestTask.label}</span>
             <span className={cn(
               'rounded-full px-2 py-0.5 text-[10px] font-medium',
               latestTask.status === 'error'
@@ -1753,21 +1901,20 @@ function SubagentPanel({
               {latestTask.status === 'error' ? '失败' : isRunning ? '运行中' : '已完成'}
             </span>
           </div>
-          <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
-            <span className="font-mono">{latestTask.taskId}</span>
-            <span>{items.length} 条更新</span>
-          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground dark:text-[#aab4c7]">
+            {isRunning ? '正在补充过程和结果。' : `${visibleItems.length || items.length} 条过程记录已整理完成。`}
+          </p>
         </div>
-        <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-border bg-card/80">
-          {expanded ? <ChevronUp size={14} className="text-muted-foreground" /> : <ChevronDown size={14} className="text-muted-foreground" />}
+        <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-border bg-card/80 dark:border-[#2b3246] dark:bg-[#151b27]">
+          {expanded ? <ChevronUp size={14} className="text-muted-foreground dark:text-[#aab4c7]" /> : <ChevronDown size={14} className="text-muted-foreground dark:text-[#aab4c7]" />}
         </div>
       </button>
 
       {expanded && (
-        <div className="border-t border-border/80 bg-card/55 px-3.5 py-3">
-          <div className="rounded-2xl border border-border/70 bg-background/65 px-3 py-3">
+        <div className="border-t border-border/80 bg-background/45 px-3.5 py-3 dark:border-[#2b3246] dark:bg-[#121824]">
+          <div className="rounded-2xl border border-border/70 bg-background/75 px-3 py-3 dark:border-[#293045] dark:bg-[#131a27]">
             {visibleItems.length === 0 ? (
-              <p className="text-[11px] text-muted-foreground">等待子任务输出...</p>
+              <p className="text-[11px] text-muted-foreground dark:text-[#aab4c7]">等待更多处理结果…</p>
             ) : (
               visibleItems.map((item, index) => {
                 if (item.kind === 'hint') {
@@ -1817,11 +1964,12 @@ function ToolCallCard({
 }) {
   const [expanded, setExpanded] = useState(false)
   const filePreview = extractFilePreviewData(call, result)
+  const toolName = getToolDisplayName(call.name)
 
   return (
     <div className="mb-1.5">
-      <div className="bg-card border border-border rounded-xl overflow-hidden shadow-sm">
-        <div className="flex items-start gap-2 px-3 py-2 hover:bg-muted/40 transition-colors">
+      <div className="overflow-hidden rounded-xl border border-border bg-card shadow-sm dark:border-[#2b3246] dark:bg-[#161b27]">
+        <div className="flex items-start gap-2 px-3 py-2 transition-colors hover:bg-muted/40 dark:hover:bg-[#1a2232]">
           {isRunning ? (
             <Loader2 size={12} className="animate-spin text-yellow-500 flex-shrink-0" />
           ) : result?.isError ? (
@@ -1833,7 +1981,7 @@ function ToolCallCard({
           )}
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-mono text-foreground flex-1 truncate">{call.name}</span>
+              <span className="flex-1 truncate text-xs font-medium text-foreground">{toolName}</span>
               <span className={cn(
                 'text-[10px] flex-shrink-0',
                 isRunning ? 'text-yellow-500' : result?.isError ? 'text-red-500' : result ? 'text-green-600' : 'text-muted-foreground'
@@ -1841,20 +1989,29 @@ function ToolCallCard({
                 {isRunning ? '执行中' : result?.isError ? '失败' : result ? '完成' : ''}
               </span>
             </div>
+            <p className="mt-1 text-[11px] leading-5 text-muted-foreground dark:text-[#aab4c7]">
+              {filePreview
+                ? `涉及文件 ${filePreview.fileName}`
+                : isRunning
+                  ? 'Agent 正在执行这个步骤。'
+                  : result?.isError
+                    ? '这个步骤没有顺利完成。'
+                    : '这个步骤已执行完成。'}
+            </p>
 
             {filePreview && (
               <button
                 onClick={() => onOpenFilePreview(filePreview)}
-                className="mt-2 flex w-full items-center gap-2 rounded-xl border border-border bg-accent/55 px-2.5 py-2 text-left transition-colors hover:bg-accent"
+                className="mt-2 flex w-full items-center gap-2 rounded-xl border border-border bg-accent/55 px-2.5 py-2 text-left transition-colors hover:bg-accent dark:border-[#2b3246] dark:bg-[#1b2332] dark:hover:bg-[#20293b]"
               >
-                <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-card shadow-sm">
+                <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-card shadow-sm dark:bg-[#151b27]">
                   <FileText size={15} className="text-primary" />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-[11px] font-medium text-foreground">{filePreview.fileName}</div>
-                  <div className="truncate text-[10px] text-muted-foreground">{filePreview.path}</div>
+                  <div className="truncate text-[10px] text-muted-foreground dark:text-[#9eabc2]">{filePreview.path}</div>
                 </div>
-                <span className="rounded-full border border-border bg-card px-2 py-0.5 text-[10px] text-muted-foreground">
+                <span className="rounded-full border border-border bg-card px-2 py-0.5 text-[10px] text-muted-foreground dark:border-[#2b3246] dark:bg-[#151b27] dark:text-[#aab4c7]">
                   {filePreview.operation === 'read_file' ? '查看内容' : '查看写入'}
                 </span>
               </button>
@@ -1863,19 +2020,25 @@ function ToolCallCard({
 
           <button
             onClick={() => setExpanded(!expanded)}
-            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md hover:bg-muted"
+            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md hover:bg-muted dark:hover:bg-[#202738]"
             aria-label={expanded ? '收起工具详情' : '展开工具详情'}
           >
-            {expanded ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
+            {expanded ? <ChevronUp size={12} className="text-muted-foreground dark:text-[#aab4c7]" /> : <ChevronDown size={12} className="text-muted-foreground dark:text-[#aab4c7]" />}
           </button>
         </div>
 
         {expanded && (
-          <div className="border-t border-border px-3 py-2 space-y-2">
+          <div className="space-y-2 border-t border-border px-3 py-2 dark:border-[#2b3246]">
+            {call.name && (
+              <div>
+                <p className="mb-1 text-[10px] text-muted-foreground">工具名</p>
+                <pre className="rounded-lg bg-muted p-2 text-[11px] font-mono text-foreground/80 dark:bg-[#111623] dark:text-[#d9e1ef]">{call.name}</pre>
+              </div>
+            )}
             {call.content && call.content !== '{}' && (
               <div>
-                <p className="text-[10px] text-muted-foreground mb-1">参数</p>
-                <pre className="text-[11px] font-mono bg-muted rounded-lg p-2 overflow-x-auto max-h-40 text-foreground/80">{call.content}</pre>
+                <p className="text-[10px] text-muted-foreground mb-1">输入参数</p>
+                <pre className="max-h-40 overflow-x-auto rounded-lg bg-muted p-2 text-[11px] font-mono text-foreground/80 dark:bg-[#111623] dark:text-[#d9e1ef]">{call.content}</pre>
               </div>
             )}
             {result && (
@@ -1885,7 +2048,9 @@ function ToolCallCard({
                 </p>
                 <pre className={cn(
                   'text-[11px] font-mono rounded-lg p-2 overflow-x-auto max-h-40',
-                  result.isError ? 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400' : 'bg-muted text-foreground/80'
+                  result.isError
+                    ? 'bg-red-50 text-red-600 dark:bg-red-950/30 dark:text-red-300'
+                    : 'bg-muted text-foreground/80 dark:bg-[#111623] dark:text-[#d9e1ef]'
                 )}>
                   {result.content?.slice(0, 800)}{(result.content?.length ?? 0) > 800 ? '...' : ''}
                 </pre>
@@ -1894,7 +2059,7 @@ function ToolCallCard({
             {isRunning && !result && (
               <div className="flex items-center gap-1.5 py-0.5">
                 <Loader2 size={10} className="animate-spin text-muted-foreground" />
-                <span className="text-[11px] text-muted-foreground">等待返回...</span>
+                <span className="text-[11px] text-muted-foreground dark:text-[#aab4c7]">等待返回...</span>
               </div>
             )}
           </div>
@@ -1932,9 +2097,9 @@ function PermissionRequestCard({
   const options = requestData?.options?.length
     ? requestData.options
     : [
-        { label: 'Allow once', scope: 'once' as const, allow: true },
-        { label: 'Always allow in this session', scope: 'session' as const, allow: true },
-        { label: 'Deny', scope: 'once' as const, allow: false },
+        { label: '允许这一次', scope: 'once' as const, allow: true },
+        { label: '本次会话都允许', scope: 'session' as const, allow: true },
+        { label: '拒绝', scope: 'once' as const, allow: false },
       ]
 
   const resultLabel = resultData
@@ -1945,7 +2110,7 @@ function PermissionRequestCard({
 
   return (
     <div className="mb-1.5">
-      <div className="overflow-hidden rounded-xl border border-amber-200/80 bg-amber-50/80 shadow-sm dark:border-amber-900/40 dark:bg-amber-950/20">
+      <div className="overflow-hidden rounded-xl border border-amber-200/80 bg-amber-50/80 shadow-sm dark:border-amber-900/40 dark:bg-[#221b12]">
         <div className="flex items-start gap-2 px-3 py-2">
           {isResolved ? (
             resultData?.approved ? (
@@ -1958,40 +2123,40 @@ function PermissionRequestCard({
           )}
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <span className="flex-1 truncate text-xs font-mono text-foreground">
-                {request.name || 'permission'}
+              <span className="flex-1 truncate text-xs font-medium text-foreground">
+                需要你的确认
               </span>
               <span className={cn(
                 'flex-shrink-0 text-[10px]',
                 isResolved
                   ? resultData?.approved ? 'text-green-600' : 'text-red-500'
-                  : 'text-amber-700'
+                  : 'text-amber-700 dark:text-amber-300'
               )}>
                 {resultLabel}
               </span>
             </div>
-            <div className="mt-1 rounded-lg border border-amber-200/70 bg-white/70 px-2.5 py-2 dark:border-amber-900/30 dark:bg-black/10">
+            <div className="mt-1 rounded-lg border border-amber-200/70 bg-white/70 px-2.5 py-2 dark:border-amber-900/30 dark:bg-[#191f2c]">
               {requestData?.command ? (
-                <p className="line-clamp-3 break-all font-mono text-[11px] text-foreground/90">
-                  {requestData.command}
+                <p className="line-clamp-3 break-all text-[11px] text-foreground/90 dark:text-[#e5ebf4]">
+                  Agent 想运行一条命令继续处理当前任务。
                 </p>
               ) : (
-                <p className="line-clamp-3 break-all text-[11px] text-foreground/90">
-                  {requestData?.message || '该工具执行需要用户确认'}
+                <p className="line-clamp-3 break-all text-[11px] text-foreground/90 dark:text-[#e5ebf4]">
+                  {requestData?.message || '这个操作需要先得到你的确认。'}
                 </p>
               )}
               {requestData?.description && (
-                <p className="mt-1 line-clamp-2 break-all text-[10px] text-muted-foreground">
+                <p className="mt-1 line-clamp-2 break-all text-[10px] text-muted-foreground dark:text-[#aab4c7]">
                   {requestData.description}
                 </p>
               )}
             </div>
-            <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
-              <span>{requestData?.isReadOnly ? '只读操作' : '可能修改环境'}</span>
-              {request.callId && <span className="font-mono">{request.callId}</span>}
+            <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground dark:text-[#aab4c7]">
+              <span>{requestData?.isReadOnly ? '只会读取信息' : '可能修改文件或环境'}</span>
+              {request.name && <span>{getToolDisplayName(request.name)}</span>}
             </div>
             {requestData?.message && (requestData.command || requestData.description) && (
-              <p className="mt-1 text-[10px] text-muted-foreground">
+              <p className="mt-1 text-[10px] text-muted-foreground dark:text-[#aab4c7]">
                 {requestData.message}
               </p>
             )}
@@ -2009,10 +2174,10 @@ function PermissionRequestCard({
                         ? option.scope === 'session'
                           ? 'bg-blue-600 text-white hover:bg-blue-700'
                           : 'bg-green-600 text-white hover:bg-green-700'
-                        : 'border border-red-200 bg-white text-red-600 hover:bg-red-50 dark:border-red-900/40 dark:bg-transparent dark:hover:bg-red-950/20'
+                        : 'border border-red-200 bg-white text-red-600 hover:bg-red-50 dark:border-red-900/40 dark:bg-[#191f2c] dark:text-red-300 dark:hover:bg-red-950/30'
                     )}
                   >
-                    {submitting === option.label ? '提交中...' : option.label}
+                    {submitting === option.label ? '提交中...' : getPermissionOptionLabel(option.label)}
                   </button>
                 ))}
               </div>
@@ -2024,7 +2189,7 @@ function PermissionRequestCard({
             className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md hover:bg-black/5 dark:hover:bg-white/5"
             aria-label={expanded ? '收起审批详情' : '展开审批详情'}
           >
-            {expanded ? <ChevronUp size={12} className="text-muted-foreground" /> : <ChevronDown size={12} className="text-muted-foreground" />}
+            {expanded ? <ChevronUp size={12} className="text-muted-foreground dark:text-[#aab4c7]" /> : <ChevronDown size={12} className="text-muted-foreground dark:text-[#aab4c7]" />}
           </button>
         </div>
 
@@ -2032,8 +2197,8 @@ function PermissionRequestCard({
           <div className="space-y-2 border-t border-amber-200/70 px-3 py-2 dark:border-amber-900/30">
             {requestData?.toolInput && (
               <div>
-                <p className="mb-1 text-[10px] text-muted-foreground">工具输入</p>
-                <pre className="max-h-40 overflow-x-auto rounded-lg bg-background/80 p-2 text-[11px] font-mono text-foreground/80">
+                <p className="mb-1 text-[10px] text-muted-foreground">操作详情</p>
+                <pre className="max-h-40 overflow-x-auto rounded-lg bg-background/80 p-2 text-[11px] font-mono text-foreground/80 dark:bg-[#191f2c] dark:text-[#dce3ef]">
                   {requestData.toolInput}
                 </pre>
               </div>
@@ -2041,7 +2206,7 @@ function PermissionRequestCard({
             {resultData?.message && (
               <div>
                 <p className="mb-1 text-[10px] text-muted-foreground">审批结果</p>
-                <pre className="overflow-x-auto rounded-lg bg-background/80 p-2 text-[11px] font-mono text-foreground/80">
+                <pre className="overflow-x-auto rounded-lg bg-background/80 p-2 text-[11px] font-mono text-foreground/80 dark:bg-[#191f2c] dark:text-[#dce3ef]">
                   {resultData.message}
                 </pre>
               </div>
@@ -2068,13 +2233,13 @@ function FilePreviewDrawer({ preview, onClose }: { preview: FilePreviewData | nu
 
       <aside
         className={cn(
-          'absolute inset-y-0 right-0 z-30 flex w-full max-w-3xl flex-col border-l border-border bg-card shadow-2xl transition-transform duration-300 ease-out',
+          'absolute inset-y-0 right-0 z-30 flex w-full max-w-3xl flex-col border-l border-border bg-card shadow-2xl transition-transform duration-300 ease-out dark:border-[#2b3246] dark:bg-[#151b27]',
           isOpen ? 'translate-x-0' : 'translate-x-full'
         )}
       >
-        <div className="border-b border-border bg-card/95 px-5 py-4 backdrop-blur-sm">
+        <div className="border-b border-border bg-card/95 px-5 py-4 backdrop-blur-sm dark:border-[#2b3246] dark:bg-[#151b27]">
           <div className="flex items-start gap-3">
-            <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-2xl bg-accent shadow-sm">
+            <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-2xl bg-accent shadow-sm dark:bg-[#1b2332]">
               <FileText size={18} className="text-primary" />
             </div>
             <div className="min-w-0 flex-1">
@@ -2083,42 +2248,42 @@ function FilePreviewDrawer({ preview, onClose }: { preview: FilePreviewData | nu
                   {preview?.fileName || '文件预览'}
                 </h3>
                 {preview && (
-                  <span className="rounded-full border border-border bg-accent/70 px-2 py-0.5 text-[10px] text-muted-foreground">
+                  <span className="rounded-full border border-border bg-accent/70 px-2 py-0.5 text-[10px] text-muted-foreground dark:border-[#2b3246] dark:bg-[#1b2332] dark:text-[#aab4c7]">
                     {preview.operation === 'read_file' ? 'read_file' : 'write_file'}
                   </span>
                 )}
               </div>
-              <p className="mt-1 break-all text-[11px] text-muted-foreground">{preview?.path || ''}</p>
+              <p className="mt-1 break-all text-[11px] text-muted-foreground dark:text-[#aab4c7]">{preview?.path || ''}</p>
               {preview?.operation === 'read_file' && preview.limit != null && (
-                <p className="mt-1 text-[10px] text-muted-foreground">展示读取结果，调用限制为 {preview.limit} 行</p>
+                <p className="mt-1 text-[10px] text-muted-foreground dark:text-[#aab4c7]">展示读取结果，调用限制为 {preview.limit} 行</p>
               )}
               {preview?.operation === 'write_file' && (
-                <p className="mt-1 text-[10px] text-muted-foreground">展示写入文件时提交的内容</p>
+                <p className="mt-1 text-[10px] text-muted-foreground dark:text-[#aab4c7]">展示写入文件时提交的内容</p>
               )}
             </div>
             <button
               onClick={onClose}
-              className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-border bg-card transition-colors hover:bg-muted"
+              className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl border border-border bg-card transition-colors hover:bg-muted dark:border-[#2b3246] dark:bg-[#151b27] dark:hover:bg-[#202738]"
               aria-label="关闭文件预览"
             >
-              <X size={15} className="text-muted-foreground" />
+              <X size={15} className="text-muted-foreground dark:text-[#aab4c7]" />
             </button>
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-auto bg-background/65 p-5">
+        <div className="min-h-0 flex-1 overflow-auto bg-background/65 p-5 dark:bg-[#101521]">
           {preview?.content ? (
-            <pre className="min-h-full overflow-auto rounded-2xl border border-border bg-card p-4 font-mono text-[12px] leading-6 text-foreground shadow-sm whitespace-pre-wrap break-words">
+            <pre className="min-h-full overflow-auto whitespace-pre-wrap break-words rounded-2xl border border-border bg-card p-4 font-mono text-[12px] leading-6 text-foreground shadow-sm dark:border-[#2b3246] dark:bg-[#151b27] dark:text-[#e3e9f5]">
               {preview.content}
             </pre>
           ) : (
-            <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-border bg-card/50 p-8 text-center">
+            <div className="flex h-full items-center justify-center rounded-2xl border border-dashed border-border bg-card/50 p-8 text-center dark:border-[#2b3246] dark:bg-[#151b27]">
               <div>
-                <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent">
+                <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent dark:bg-[#1b2332]">
                   <FileText size={18} className="text-primary" />
                 </div>
                 <p className="text-sm font-medium text-foreground">没有可展示的文件内容</p>
-                <p className="mt-1 text-xs text-muted-foreground">这个工具调用没有返回可预览的文本。</p>
+                <p className="mt-1 text-xs text-muted-foreground dark:text-[#aab4c7]">这个工具调用没有返回可预览的文本。</p>
               </div>
             </div>
           )}
@@ -2135,14 +2300,14 @@ function ThinkingIndicator({ content }: { content: string }) {
     <div className="flex justify-start">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="max-w-[80%] bg-card border border-border rounded-2xl rounded-bl-sm shadow-sm px-3.5 py-2 text-left hover:bg-muted/50 transition-colors"
+        className="max-w-[80%] rounded-2xl rounded-bl-sm border border-border bg-card px-3.5 py-2 text-left shadow-sm transition-colors hover:bg-muted/50 dark:border-[#2b3246] dark:bg-[#161b27] dark:hover:bg-[#1b2332]"
       >
         <div className="flex items-center gap-2">
-          <Brain size={12} className="text-purple-500 animate-pulse" />
-          <span className="text-xs text-muted-foreground">思考中...</span>
+          <Brain size={12} className="animate-pulse text-primary" />
+          <span className="text-xs text-muted-foreground dark:text-[#aab4c7]">Agent 正在整理答案</span>
         </div>
         {expanded && (
-          <p className="text-xs text-muted-foreground mt-1.5 whitespace-pre-wrap max-h-32 overflow-y-auto">{content}</p>
+          <p className="mt-1.5 max-h-32 overflow-y-auto whitespace-pre-wrap text-xs text-muted-foreground dark:text-[#d6deec]">{content}</p>
         )}
       </button>
     </div>

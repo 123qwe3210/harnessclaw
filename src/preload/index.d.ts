@@ -19,10 +19,24 @@ interface AppRuntimeStatus {
   lastError?: string
 }
 
-type LogViewerThreshold = 'error' | 'info' | 'debug'
+type LogViewerThreshold = 'fatal' | 'error' | 'info' | 'debug'
 type LogViewerFile = 'all' | 'app' | 'renderer'
 type RuntimeLogFile = 'app' | 'renderer'
-type RuntimeLogLevel = 'debug' | 'info' | 'warn' | 'error'
+type RuntimeLogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal'
+type DiagnosticDomain =
+  | 'app.lifecycle'
+  | 'config'
+  | 'runtime.nanobot'
+  | 'runtime.gateway'
+  | 'runtime.harnessclaw'
+  | 'runtime.clawhub'
+  | 'comm.websocket'
+  | 'chat'
+  | 'doctor'
+  | 'storage.db'
+  | 'storage.files'
+  | 'ui'
+  | 'ipc'
 
 interface RuntimeLogEntry {
   cursor: string
@@ -32,6 +46,9 @@ interface RuntimeLogEntry {
   source: string
   message: string
   metaText: string
+  meta: Record<string, unknown> | null
+  domain?: DiagnosticDomain
+  action?: string
   file: RuntimeLogFile
   raw: string
 }
@@ -39,6 +56,8 @@ interface RuntimeLogEntry {
 interface GetLogsOptions {
   after?: string
   level?: LogViewerThreshold
+  exactLevel?: 'all' | RuntimeLogLevel
+  domain?: DiagnosticDomain | 'all'
   query?: string
   file?: LogViewerFile
   limit?: number
@@ -50,12 +69,71 @@ interface GetLogsResult {
   logDir: string
 }
 
+interface DiagnosticEventRecord {
+  cursor: string
+  timestamp: number
+  ts: string
+  level: RuntimeLogLevel
+  domain: DiagnosticDomain
+  action: string
+  status: string
+  summary: string
+  runId: string
+  source: string
+  requestId?: string
+  sessionId?: string
+  errorCode?: string
+  durationMs?: number
+  details: Record<string, unknown>
+}
+
+interface UserSummaryItem {
+  id: string
+  level: RuntimeLogLevel
+  domain: DiagnosticDomain
+  title: string
+  status: string
+  isNormal: boolean
+  currentStatus: string
+  impact: string
+  suggestion: string
+  timestamp: number
+  isoTime: string
+}
+
+interface GetDiagnosticEventsOptions {
+  after?: string
+  level?: LogViewerThreshold
+  exactLevel?: 'all' | RuntimeLogLevel
+  domain?: DiagnosticDomain | 'all'
+  status?: string
+  query?: string
+  sessionId?: string
+  requestId?: string
+  limit?: number
+}
+
+interface GetDiagnosticEventsResult {
+  items: DiagnosticEventRecord[]
+  cursor: string | null
+  logDir: string
+}
+
+interface AvailableLogDomain {
+  value: DiagnosticDomain
+  count: number
+}
+
 interface AppRuntimeAPI {
   getStatus: () => Promise<AppRuntimeStatus>
   getLogLevel: () => Promise<LogViewerThreshold>
   getLogs: (options?: GetLogsOptions) => Promise<GetLogsResult>
+  getDiagnosticEvents: (options?: GetDiagnosticEventsOptions) => Promise<GetDiagnosticEventsResult>
+  getDiagnosticSummary: () => Promise<{ items: UserSummaryItem[] }>
+  getAvailableLogDomains: () => Promise<AvailableLogDomain[]>
   openLogsDirectory: () => Promise<{ ok: boolean; path: string; error?: string }>
-  logRenderer: (level: 'debug' | 'info' | 'warn' | 'error', message: string, details?: Record<string, unknown>) => Promise<{ ok: boolean }>
+  clearLogs: () => Promise<{ ok: boolean; cleared: string[]; error?: string }>
+  logRenderer: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: string, details?: Record<string, unknown>) => Promise<{ ok: boolean }>
   trackUsage: (entry: {
     category: string
     action: string

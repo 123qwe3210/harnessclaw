@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
+import { recordFailure, recordMilestone, recordRetry } from './logging'
 
 interface DeviceCredentials {
   deviceId: string
@@ -64,9 +65,29 @@ export class GatewayClient extends EventEmitter {
         publicKeyPem: device.publicKeyPem,
         token: auth.tokens?.operator?.token || ''
       }
-      console.log('[Gateway] Credentials loaded, deviceId:', device.deviceId.slice(0, 8) + '...')
+      recordMilestone({
+        domain: 'runtime.gateway',
+        action: 'credentials.loaded',
+        summary: 'Gateway 凭证已加载',
+        source: 'gateway',
+        details: {
+          currentStatus: '连接前置凭证已就绪',
+          impact: '可以继续发起 gateway 连接',
+          suggestion: '当前无需处理',
+          deviceIdPreview: `${device.deviceId.slice(0, 8)}...`,
+        },
+      })
     } catch (e) {
-      console.error('[Gateway] Failed to load credentials:', e)
+      recordFailure({
+        domain: 'runtime.gateway',
+        action: 'credentials.load',
+        summary: 'Gateway 凭证加载失败',
+        source: 'gateway',
+        reason: e instanceof Error ? e.message : String(e),
+        impact: 'gateway 连接不可用',
+        suggestion: '请检查本地 identity 目录与凭证文件',
+        details: { error: e },
+      })
     }
   }
 
@@ -89,7 +110,15 @@ export class GatewayClient extends EventEmitter {
   connect(): void {
     if (this.status === 'connected' || this.status === 'connecting') return
     if (!this.credentials) {
-      console.warn('[Gateway] No credentials loaded, skipping connection')
+      recordFailure({
+        domain: 'runtime.gateway',
+        action: 'connect',
+        summary: 'Gateway 连接失败：未找到凭证',
+        source: 'gateway',
+        reason: 'credentials unavailable',
+        impact: 'gateway 相关功能不可用',
+        suggestion: '请先完成本地配对或检查凭证文件',
+      })
       this.setStatus('disconnected')
       return
     }
@@ -104,11 +133,32 @@ export class GatewayClient extends EventEmitter {
       this.ws.close()
     }
 
-    console.log('[Gateway] Connecting to', this.gatewayUrl)
+    recordMilestone({
+      domain: 'comm.websocket',
+      action: 'gateway.connect',
+      summary: '正在连接 Gateway',
+      source: 'gateway',
+      details: {
+        currentStatus: '连接进行中',
+        impact: '连接成功后可使用 gateway 能力',
+        suggestion: '如持续失败，请检查 gateway 服务是否可达',
+        url: this.gatewayUrl,
+      },
+    })
     this.ws = new WebSocket(this.gatewayUrl)
 
     this.ws.on('open', () => {
-      console.log('[Gateway] WebSocket opened, waiting for challenge...')
+      recordMilestone({
+        domain: 'comm.websocket',
+        action: 'gateway.connected',
+        summary: 'Gateway websocket 已连接，等待鉴权挑战',
+        source: 'gateway',
+        details: {
+          currentStatus: '连接已建立，鉴权进行中',
+          impact: '完成 challenge 后才能正式使用 gateway',
+          suggestion: '当前无需处理',
+        },
+      })
       this.reconnectAttempts = 0
     })
 
@@ -117,22 +167,58 @@ export class GatewayClient extends EventEmitter {
         const msg = JSON.parse(data.toString())
         this.handleMessage(msg)
       } catch (e) {
-        console.error('[Gateway] Failed to parse message:', e)
+        recordFailure({
+          domain: 'comm.websocket',
+          action: 'gateway.parse',
+          summary: 'Gateway 消息解析失败',
+          source: 'gateway',
+          reason: e instanceof Error ? e.message : String(e),
+          impact: '当前消息无法处理，连接状态可能不一致',
+          suggestion: '请检查 gateway 服务端输出',
+          details: { error: e },
+        })
       }
     })
 
     this.ws.on('error', (err) => {
-      console.error('[Gateway] WebSocket error:', err.message)
+      recordFailure({
+        domain: 'comm.websocket',
+        action: 'gateway.error',
+        summary: `Gateway 连接失败：${err.message}`,
+        source: 'gateway',
+        reason: err.message,
+        impact: 'gateway 连接暂时不可用',
+        suggestion: '请检查 gateway 服务是否正常运行',
+        details: { error: err },
+      })
     })
 
     this.ws.on('close', (code, reason) => {
       const reasonStr = reason.toString()
-      console.log('[Gateway] WebSocket closed:', code, reasonStr)
+      recordFailure({
+        domain: 'comm.websocket',
+        action: 'gateway.closed',
+        summary: 'Gateway 连接已关闭',
+        source: 'gateway',
+        reason: `close code ${code} ${reasonStr}`.trim(),
+        impact: 'gateway 功能暂时不可用',
+        suggestion: code === 1008 ? '请检查设备签名与鉴权信息' : '系统会自动重连，请稍候',
+        details: { code, reason: reasonStr },
+      })
       this.setStatus('disconnected')
       this.stopHeartbeat()
       // 1008 = policy violation (device signature invalid) — permanent auth failure, don't retry
       if (code === 1008) {
-        console.warn('[Gateway] Auth failed permanently, will not reconnect:', reasonStr)
+        recordFailure({
+          domain: 'runtime.gateway',
+          action: 'auth.failed',
+          summary: 'Gateway 鉴权失败，系统不会继续重连',
+          source: 'gateway',
+          reason: reasonStr || 'policy violation',
+          impact: 'gateway 功能不可用，需人工修复',
+          suggestion: '请检查设备凭证和签名配置',
+          details: { code, reason: reasonStr },
+        })
         this.authFailed = true
         return
       }
@@ -221,18 +307,46 @@ export class GatewayClient extends EventEmitter {
 
       this.waitForResponse(connectRequest.id, 10000)
         .then((response) => {
-          console.log('[Gateway] Connected!', JSON.stringify(response).slice(0, 200))
+          recordMilestone({
+            domain: 'runtime.gateway',
+            action: 'ready',
+            summary: 'Gateway 已连接并完成鉴权',
+            source: 'gateway',
+            details: {
+              currentStatus: 'gateway 已就绪',
+              impact: '相关远程能力可以正常使用',
+              suggestion: '当前无需处理',
+            },
+          })
           this.setStatus('connected')
           this.startHeartbeat()
           this.emit('connected', response)
         })
         .catch((e) => {
-          console.error('[Gateway] Connection failed:', e)
+          recordFailure({
+            domain: 'runtime.gateway',
+            action: 'connect',
+            summary: 'Gateway 连接失败',
+            source: 'gateway',
+            reason: e instanceof Error ? e.message : String(e),
+            impact: 'gateway 功能暂时不可用',
+            suggestion: '系统会自动重连，请检查网络与服务状态',
+            details: { error: e },
+          })
           this.setStatus('disconnected')
           this.scheduleReconnect()
         })
     } catch (e) {
-      console.error('[Gateway] Challenge handling failed:', e)
+      recordFailure({
+        domain: 'runtime.gateway',
+        action: 'challenge',
+        summary: 'Gateway 鉴权挑战处理失败',
+        source: 'gateway',
+        reason: e instanceof Error ? e.message : String(e),
+        impact: 'gateway 无法完成连接',
+        suggestion: '请检查本地凭证与服务端挑战格式',
+        details: { error: e },
+      })
       this.setStatus('disconnected')
       this.scheduleReconnect()
     }
@@ -272,7 +386,15 @@ export class GatewayClient extends EventEmitter {
   private scheduleReconnect(): void {
     if (this.authFailed) return
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log('[Gateway] Max reconnect attempts reached')
+      recordFailure({
+        domain: 'runtime.gateway',
+        action: 'retry',
+        summary: 'Gateway 已达到最大重连次数',
+        source: 'gateway',
+        reason: `retries exhausted: ${this.maxReconnectAttempts}`,
+        impact: 'gateway 连接不会再自动恢复',
+        suggestion: '请检查 gateway 服务后手动重启应用或重新连接',
+      })
       return
     }
 
@@ -280,7 +402,16 @@ export class GatewayClient extends EventEmitter {
 
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
     this.reconnectAttempts++
-    console.log(`[Gateway] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`)
+    recordRetry({
+      domain: 'runtime.gateway',
+      action: 'retry',
+      summary: `Gateway 连接失败：系统将在 ${delay}ms 后自动重试`,
+      source: 'gateway',
+      retryInMs: delay,
+      reason: '连接尚未恢复',
+      impact: '在重连成功前，gateway 功能不可用',
+      suggestion: '请检查 gateway 服务状态',
+    })
 
     this.setStatus('reconnecting')
     this.reconnectTimer = setTimeout(() => {

@@ -6,6 +6,7 @@ import { homedir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { readEngineConfig } from './config'
+import { recordFailure, recordMilestone, recordRetry, sanitizeDiagnosticDetails } from './logging'
 
 interface HarnessclawConfig {
   enabled: boolean
@@ -127,6 +128,10 @@ const HARNESSCLAW_WS_HOST = '0.0.0.0'
 const HARNESSCLAW_WS_PORT = 8081
 const HARNESSCLAW_WS_PATH = '/ws'
 
+function summarizePayload(payload: unknown): Record<string, unknown> {
+  return sanitizeDiagnosticDetails(payload || {})
+}
+
 export class HarnessclawClient extends EventEmitter {
   private ws: WebSocket | null = null
   private status: HarnessclawStatus = 'disconnected'
@@ -145,6 +150,42 @@ export class HarnessclawClient extends EventEmitter {
   private transportWaiters: Array<{ resolve: () => void; reject: (error: Error) => void }> = []
   private sessionInitWaiters: Array<{ resolve: (sessionId: string) => void; reject: (error: Error) => void }> = []
   private pendingPongWaiters: Array<(ok: boolean) => void> = []
+
+  private logMilestone(action: string, summary: string, details?: Record<string, unknown>): void {
+    recordMilestone({
+      domain: action.startsWith('chat.') ? 'chat' : action.startsWith('websocket.') ? 'comm.websocket' : 'runtime.harnessclaw',
+      action,
+      summary,
+      source: 'harnessclaw',
+      details,
+    })
+  }
+
+  private logFailure(
+    action: string,
+    summary: string,
+    reason: string,
+    impact: string,
+    suggestion: string,
+    details?: Record<string, unknown>,
+    sessionId?: string,
+    requestId?: string,
+    errorCode?: string,
+  ): void {
+    recordFailure({
+      domain: action.startsWith('chat.') ? 'chat' : action.startsWith('websocket.') ? 'comm.websocket' : 'runtime.harnessclaw',
+      action,
+      summary,
+      source: 'harnessclaw',
+      reason,
+      impact,
+      suggestion,
+      details,
+      sessionId,
+      requestId,
+      errorCode,
+    })
+  }
 
   connect(): void {
     const wasReconnecting = this.shouldReconnect
@@ -179,13 +220,26 @@ export class HarnessclawClient extends EventEmitter {
     if (!cfg || !cfg.enabled) {
       this.setStatus('disconnected')
       this.rejectTransportWaiters(new Error('Harnessclaw websocket channel not found in config'))
+      this.logFailure(
+        'websocket.connect',
+        '连接 Harnessclaw 失败：本地 websocket 配置缺失',
+        '未找到 websocket channel 配置',
+        '本地服务无法连接，聊天功能不可用',
+        '请检查本地配置文件是否存在并启用了 websocket',
+      )
       this.emitCompatEvent({ type: 'error', content: 'Harnessclaw websocket channel not found in config' })
       return
     }
 
     const url = new URL(`ws://${cfg.host}:${cfg.port}${cfg.path.startsWith('/') ? cfg.path : `/${cfg.path}`}`)
 
-    console.log(`[Harnessclaw] Connecting to ${url.toString()} (attempt ${this.retryCount + 1})`)
+    this.logMilestone('websocket.connect', '正在连接 Harnessclaw 本地服务', {
+      currentStatus: '连接进行中',
+      impact: '连接成功后即可开始会话与消息收发',
+      suggestion: '如持续失败，请检查本地运行时是否正常运行',
+      url: url.toString(),
+      attempt: this.retryCount + 1,
+    })
     this.setStatus('connecting')
 
     const headers: Record<string, string> = {}
@@ -196,9 +250,13 @@ export class HarnessclawClient extends EventEmitter {
     this.ws = new WebSocket(url, Object.keys(headers).length > 0 ? { headers } : undefined)
 
     this.ws.on('open', () => {
-      console.log('[Harnessclaw] WebSocket opened')
       this.retryCount = 0
       this.setStatus('connected')
+      this.logMilestone('websocket.connected', 'Harnessclaw 已连接', {
+        currentStatus: '本地 websocket 已连接',
+        impact: '现在可以发送消息与接收响应',
+        suggestion: '当前无需处理',
+      })
       this.resolveTransportWaiters()
       if (this.pendingSessionInitId) {
         this.sendSessionCreate(this.pendingSessionInitId)
@@ -208,20 +266,40 @@ export class HarnessclawClient extends EventEmitter {
     this.ws.on('message', (data) => {
       try {
         const raw = data.toString()
-        console.log('[Harnessclaw] ← recv:', raw)
         const msg = JSON.parse(raw) as Record<string, unknown>
         this.handleMessage(msg)
       } catch (e) {
-        console.error('[Harnessclaw] Failed to parse message:', e)
+        this.logFailure(
+          'websocket.parse',
+          '解析 Harnessclaw 消息失败',
+          e instanceof Error ? e.message : String(e),
+          '当前收到的服务端消息无法被处理，相关响应可能丢失',
+          '请检查本地服务日志并确认消息协议是否一致',
+          { error: e },
+        )
       }
     })
 
     this.ws.on('error', (err) => {
-      console.error('[Harnessclaw] WebSocket error:', err.message)
+      this.logFailure(
+        'websocket.error',
+        `连接 Harnessclaw 失败：${err.message}`,
+        err.message,
+        '本地连接不可用，系统会继续尝试恢复',
+        '请检查本地服务是否正常运行',
+        { error: err },
+      )
     })
 
     this.ws.on('close', (code, reason) => {
-      console.log('[Harnessclaw] WebSocket closed:', code, reason.toString())
+      this.logFailure(
+        'websocket.closed',
+        'Harnessclaw 连接已关闭',
+        `close code ${code} ${reason.toString()}`.trim(),
+        '当前会话连接已断开，消息发送会失败',
+        this.shouldReconnect ? '系统将自动重连，请稍候' : '如需恢复，请重新连接本地服务',
+        { code, reason: reason.toString() },
+      )
       const reconnectSessionId = this.pendingSessionInitId || this.defaultSessionId
       this.ws = null
       this.pendingMessages.clear()
@@ -242,11 +320,26 @@ export class HarnessclawClient extends EventEmitter {
   private scheduleRetry(): void {
     if (!this.shouldReconnect) return
     if (this.retryCount >= this.maxRetries) {
-      console.warn('[Harnessclaw] Max retries reached, giving up')
+      this.logFailure(
+        'websocket.retry',
+        '连接 Harnessclaw 失败：已达到最大重试次数',
+        `重试次数已达到 ${this.maxRetries}`,
+        '本地连接不会再自动恢复，聊天功能不可用',
+        '请检查本地服务状态后手动重新连接',
+      )
       return
     }
     const delay = Math.min(1000 * Math.max(1, 2 ** Math.min(this.retryCount, 4)), 30_000)
-    console.log(`[Harnessclaw] Retry in ${delay}ms...`)
+    recordRetry({
+      domain: 'comm.websocket',
+      action: 'websocket.retry',
+      summary: `连接 Harnessclaw 失败：系统将在 ${delay}ms 后自动重试`,
+      source: 'harnessclaw',
+      retryInMs: delay,
+      reason: '连接尚未恢复',
+      impact: '在重试成功前，消息发送与会话同步不可用',
+      suggestion: '请检查本地服务是否正常运行',
+    })
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null
       this.retryCount++
@@ -317,7 +410,6 @@ export class HarnessclawClient extends EventEmitter {
     }
 
     this.sessionCreateInFlight = true
-    console.log('[Harnessclaw] → send:', JSON.stringify(payload))
     this.ws.send(JSON.stringify(payload))
   }
 
@@ -401,6 +493,13 @@ export class HarnessclawClient extends EventEmitter {
           blocks: new Map<number, PendingContentBlock>(),
         })
         if (!hadPendingMessage) {
+          this.logMilestone('chat.response.started', '已开始接收回复', {
+            currentStatus: '模型正在生成回复',
+            impact: '当前会话已进入响应阶段',
+            suggestion: '请等待回复完成',
+            sessionId,
+            requestId: typeof msg.request_id === 'string' ? msg.request_id : undefined,
+          })
           this.emitCompatEvent({
             type: 'turn_start',
             session_id: sessionId,
@@ -584,6 +683,14 @@ export class HarnessclawClient extends EventEmitter {
             usage,
           })
         } else {
+          this.logMilestone('chat.response.completed', '回复已完成', {
+            currentStatus: '本轮响应已结束',
+            impact: '可以继续发送下一条消息',
+            suggestion: '当前无需处理',
+            sessionId,
+            requestId: typeof msg.request_id === 'string' ? msg.request_id : undefined,
+            usage,
+          })
           this.emitCompatEvent({
             type: 'response_end',
             session_id: sessionId,
@@ -608,6 +715,17 @@ export class HarnessclawClient extends EventEmitter {
           this.sessionCreateInFlight = false
           this.rejectSessionInitWaiters(new Error(content))
         }
+        this.logFailure(
+          'chat.error',
+          '消息处理失败',
+          content,
+          '当前请求无法正常完成，会话状态可能不完整',
+          '请检查本地服务是否正常运行后重试',
+          { error, sessionId, requestId: msg.request_id },
+          sessionId,
+          typeof msg.request_id === 'string' ? msg.request_id : undefined,
+          typeof error.code === 'string' ? error.code : undefined,
+        )
         this.emitCompatEvent({
           type: 'error',
           session_id: sessionId,
@@ -654,6 +772,13 @@ export class HarnessclawClient extends EventEmitter {
   async send(content: string, sessionId?: string): Promise<boolean> {
     const resolvedSessionId = sessionId || this.defaultSessionId
     if (!resolvedSessionId) {
+      this.logFailure(
+        'chat.send',
+        '消息发送失败：没有可用会话',
+        '当前没有激活的会话',
+        '消息不会发送到本地服务',
+        '请先创建或选择一个会话',
+      )
       this.emitCompatEvent({ type: 'error', content: 'No active Harnessclaw session' })
       return false
     }
@@ -673,11 +798,27 @@ export class HarnessclawClient extends EventEmitter {
           text: content,
         },
       }
-      console.log('[Harnessclaw] → send:', JSON.stringify(payload))
+      this.logMilestone('chat.send', '消息已发送到本地服务', {
+        currentStatus: '本地服务已收到发送请求',
+        impact: '系统将开始等待模型响应',
+        suggestion: '请等待回复完成',
+        sessionId: resolvedSessionId,
+        contentLength: content.length,
+        contentPreview: content.slice(0, 80),
+      })
       this.ws.send(JSON.stringify(payload))
       this.knownSessions.set(resolvedSessionId, Date.now())
       return true
     } catch (error) {
+      this.logFailure(
+        'chat.send',
+        '消息发送失败：请检查本地服务是否正常运行',
+        error instanceof Error ? error.message : String(error),
+        '当前消息未送达，无法开始生成回复',
+        '请确认本地运行时和 websocket 连接正常后重试',
+        { sessionId: resolvedSessionId, contentLength: content.length },
+        resolvedSessionId,
+      )
       this.emitCompatEvent({
         type: 'error',
         session_id: resolvedSessionId,
@@ -714,7 +855,6 @@ export class HarnessclawClient extends EventEmitter {
         event_id: makeEventId(),
         session_id: resolvedSessionId,
       }
-      console.log('[Harnessclaw] → send:', JSON.stringify(payload))
       this.ws.send(JSON.stringify(payload))
       return true
     } catch (error) {
@@ -767,7 +907,6 @@ export class HarnessclawClient extends EventEmitter {
 
         this.pendingPongWaiters.push(waiter)
         const payload = { type: 'ping', event_id: makeEventId() }
-        console.log('[Harnessclaw] → send:', JSON.stringify(payload))
         this.ws?.send(JSON.stringify(payload), (error) => {
           if (!error) return
           const index = this.pendingPongWaiters.indexOf(waiter)
@@ -840,7 +979,6 @@ export class HarnessclawClient extends EventEmitter {
       payload.message = message
     }
 
-    console.log('[Harnessclaw] → send:', JSON.stringify(payload))
     this.ws.send(JSON.stringify(payload))
     this.pendingPermissionRequests.delete(requestId)
 
@@ -878,7 +1016,6 @@ export class HarnessclawClient extends EventEmitter {
     }
 
     if (this.ws?.readyState === WebSocket.OPEN) {
-      console.log('[Harnessclaw] → send:', JSON.stringify(message))
       this.ws.send(JSON.stringify(message))
     }
   }

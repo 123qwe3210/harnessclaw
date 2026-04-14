@@ -25,13 +25,29 @@ const appRuntimeAPI = {
   getLogLevel: () => ipcRenderer.invoke('app-runtime:getLogLevel'),
   getLogs: (options?: {
     after?: string
-    level?: 'error' | 'info' | 'debug'
+    level?: 'fatal' | 'error' | 'info' | 'debug'
+    exactLevel?: 'all' | 'debug' | 'info' | 'warn' | 'error' | 'fatal'
+    domain?: string
     query?: string
     file?: 'all' | 'app' | 'renderer'
     limit?: number
   }) => ipcRenderer.invoke('app-runtime:getLogs', options),
+  getDiagnosticEvents: (options?: {
+    after?: string
+    level?: 'fatal' | 'error' | 'info' | 'debug'
+    exactLevel?: 'all' | 'debug' | 'info' | 'warn' | 'error' | 'fatal'
+    domain?: string
+    status?: string
+    query?: string
+    sessionId?: string
+    requestId?: string
+    limit?: number
+  }) => ipcRenderer.invoke('app-runtime:getDiagnosticEvents', options),
+  getDiagnosticSummary: () => ipcRenderer.invoke('app-runtime:getDiagnosticSummary'),
+  getAvailableLogDomains: () => ipcRenderer.invoke('app-runtime:getAvailableLogDomains'),
   openLogsDirectory: () => ipcRenderer.invoke('app-runtime:openLogsDirectory'),
-  logRenderer: (level: 'debug' | 'info' | 'warn' | 'error', message: string, details?: Record<string, unknown>) =>
+  clearLogs: () => ipcRenderer.invoke('app-runtime:clearLogs'),
+  logRenderer: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: string, details?: Record<string, unknown>) =>
     ipcRenderer.invoke('app-runtime:logRenderer', level, message, details),
   trackUsage: (entry: {
     category: string

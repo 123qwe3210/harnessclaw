@@ -23,18 +23,29 @@ import {
 } from './db'
 import {
   APP_LOG_PATH,
+  DIAGNOSTIC_DIR,
   LOGS_DIR,
   RENDERER_LOG_PATH,
   USAGE_LOG_PATH,
 } from './runtime-paths'
 import {
+  type DiagnosticDomain,
+  type GetDiagnosticEventsOptions,
   type LogLevel,
   type LogThreshold,
   type UsageLogEntry,
   ensureLoggingDirs,
+  getAvailableLogDomains,
+  getCurrentRunId,
+  getUserDiagnosticSummary,
   getLogThreshold,
   normalizeLogThreshold,
+  clearActiveLogs,
+  readDiagnosticEvents,
   readStructuredLogs,
+  recordFailure,
+  recordMilestone,
+  recordRetry,
   readTextFile,
   sanitizeForLogging,
   setLogThreshold,
@@ -88,6 +99,41 @@ interface AppRuntimeStatus {
   llmConfigured: boolean
   applyingConfig: boolean
   lastError?: string
+}
+
+function logInfo(domain: DiagnosticDomain, action: string, summary: string, details?: Record<string, unknown>, projectTo: 'app' | 'renderer' = 'app'): void {
+  recordMilestone({
+    domain,
+    action,
+    summary,
+    source: 'main',
+    details,
+    projectTo,
+  })
+}
+
+function logFailure(
+  domain: DiagnosticDomain,
+  action: string,
+  summary: string,
+  reason: string,
+  impact: string,
+  suggestion: string,
+  details?: Record<string, unknown>,
+  fatal = false,
+): void {
+  recordFailure({
+    domain,
+    action,
+    summary,
+    source: 'main',
+    reason,
+    impact,
+    suggestion,
+    details,
+    fatal,
+    projectTo: 'app',
+  })
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -179,6 +225,15 @@ function trackUsage(entry: UsageLogEntry): void {
     })
   } catch (error) {
     writeAppLog('error', 'usage', 'Failed to insert usage event', { entry, error: String(error) })
+    logFailure(
+      'ui',
+      'usage.persist',
+      '使用记录保存失败',
+      error instanceof Error ? error.message : String(error),
+      '使用统计可能缺失，但不影响主功能运行',
+      '可稍后查看日志或重试当前操作',
+      { entry, error },
+    )
   }
   writeUsageLog({ ...entry, details, createdAt })
 }
@@ -190,9 +245,12 @@ function buildExportPayload(type: string): { name: string; content: string } {
       name: `logs-export-${stamp}.json`,
       content: JSON.stringify({
         exportedAt: new Date().toISOString(),
+        runId: getCurrentRunId(),
         appLog: readTextFile(APP_LOG_PATH),
         rendererLog: readTextFile(RENDERER_LOG_PATH),
         usageLog: readTextFile(USAGE_LOG_PATH),
+        diagnosticDir: DIAGNOSTIC_DIR,
+        diagnosticEvents: readDiagnosticEvents({ level: 'debug', limit: 2000 }).items,
         usageEvents: listUsageEvents(1000),
       }, null, 2),
     }
@@ -225,9 +283,21 @@ function startHarnessclawEngine(): void {
   if (harnessclawEngineProcess) return
   if (!HARNESSCLAW_ENGINE_BIN || !existsSync(HARNESSCLAW_ENGINE_BIN)) {
     console.warn('[HarnessclawEngine] Binary not found:', HARNESSCLAW_ENGINE_BIN || '<missing>')
+    logFailure(
+      'runtime.harnessclaw',
+      'start',
+      '本地运行时启动失败：未找到可执行文件',
+      'bundled binary 缺失',
+      '本地运行时不可用，聊天与连接功能无法工作',
+      '请确认 resources/bin 下存在 harnessclaw-engine 可执行文件',
+      { binaryPath: HARNESSCLAW_ENGINE_BIN || '<missing>' },
+    )
     return
   }
-  console.log('[HarnessclawEngine] Starting engine...')
+  logInfo('runtime.harnessclaw', 'start.requested', '已请求启动本地运行时', {
+    binaryPath: HARNESSCLAW_ENGINE_BIN,
+    configPath: ENGINE_CONFIG_PATH,
+  })
   harnessclawEngineProcess = spawn(HARNESSCLAW_ENGINE_BIN, ['-config', ENGINE_CONFIG_PATH], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
@@ -239,18 +309,38 @@ function startHarnessclawEngine(): void {
     process.stderr.write(`[HarnessclawEngine] ${data}`)
   })
   harnessclawEngineProcess.on('error', (err) => {
-    console.error('[HarnessclawEngine] Failed to start:', err)
+    logFailure(
+      'runtime.harnessclaw',
+      'start',
+      '本地运行时启动失败：进程创建未成功',
+      err instanceof Error ? err.message : String(err),
+      '本地运行时不可用，聊天与连接功能无法工作',
+      '请检查本地运行时文件和配置是否有效',
+      { error: err },
+    )
     harnessclawEngineProcess = null
   })
   harnessclawEngineProcess.on('exit', (code) => {
-    console.log('[HarnessclawEngine] Exited with code:', code)
+    if (code === 0 || code === null) {
+      logInfo('runtime.harnessclaw', 'stop', '本地运行时已停止', { exitCode: code })
+    } else {
+      logFailure(
+        'runtime.harnessclaw',
+        'exit',
+        '本地运行时异常退出',
+        `退出码 ${code}`,
+        '本地服务连接会中断，相关功能暂时不可用',
+        '请检查本地运行时日志并尝试重新启动应用',
+        { exitCode: code },
+      )
+    }
     harnessclawEngineProcess = null
   })
 }
 
 function stopHarnessclawEngine(): void {
   if (!harnessclawEngineProcess) return
-  console.log('[HarnessclawEngine] Stopping engine...')
+  logInfo('runtime.harnessclaw', 'stop.requested', '已请求停止本地运行时')
   harnessclawEngineProcess.kill('SIGTERM')
   harnessclawEngineProcess = null
 }
@@ -297,10 +387,45 @@ app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.iflytek.harnessclaw')
   ensureLoggingDirs()
   setLogThreshold(normalizeLogThreshold(asRecord(readHarnessclawConfig({})).logging?.level))
-  writeAppLog('info', 'app.lifecycle', 'Application ready')
+  logInfo('app.lifecycle', 'startup', '应用启动成功', {
+    currentStatus: '本地应用已完成初始化',
+    impact: '主界面与本地服务连接流程已开始工作',
+    suggestion: '当前无需处理',
+    runId: getCurrentRunId(),
+  })
+
+  process.on('uncaughtException', (error) => {
+    logFailure(
+      'app.lifecycle',
+      'uncaughtException',
+      '应用发生未捕获异常',
+      error.message,
+      '当前操作可能失败，部分功能可能不可用',
+      '请查看诊断日志并尝试重新启动应用',
+      { error },
+      true,
+    )
+  })
+
+  process.on('unhandledRejection', (reason) => {
+    logFailure(
+      'app.lifecycle',
+      'unhandledRejection',
+      '应用发生未处理的异步异常',
+      reason instanceof Error ? reason.message : String(reason),
+      '当前操作可能失败，部分功能可能不可用',
+      '请查看诊断日志并尝试重新执行操作',
+      { reason },
+    )
+  })
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
+    logInfo('app.lifecycle', 'window.created', '主窗口已创建', {
+      currentStatus: '桌面窗口已创建',
+      impact: '界面交互已就绪',
+      suggestion: '当前无需处理',
+    })
   })
 
   // First-launch detection
@@ -322,12 +447,36 @@ app.whenReady().then(() => {
 
   // Config file read/write
   ipcMain.handle('config:read', () => {
-    return readEngineConfig({ providers: {} })
+    const config = readEngineConfig({ providers: {} })
+    logInfo('config', 'read', '已读取运行时配置', {
+      currentStatus: '当前配置已载入',
+      impact: '设置页显示的是最近一次保存的配置',
+      suggestion: '如需修改，可在设置页保存并应用',
+    })
+    return config
   })
 
   ipcMain.handle('config:save', (_, data: unknown) => {
     ensureDir(HARNESSCLAW_DIR)
-    return saveEngineConfig(data)
+    const result = saveEngineConfig(data)
+    if (result.ok) {
+      logInfo('config', 'save', '配置已保存：运行时配置已更新', {
+        currentStatus: '配置文件已写入本地磁盘',
+        impact: '下次应用或重启运行时会使用新配置',
+        suggestion: '如需立即生效，请执行应用配置或重启运行时',
+      })
+    } else {
+      logFailure(
+        'config',
+        'save',
+        '配置保存失败：运行时配置未写入',
+        result.error || '未知错误',
+        '新配置不会生效，系统继续使用旧配置',
+        '请检查配置内容和本地目录写入权限',
+        { config: data },
+      )
+    }
+    return result
   })
 
   ipcMain.handle('app-config:read', () => {
@@ -340,6 +489,21 @@ app.whenReady().then(() => {
     if (result.ok) {
       setLogThreshold(normalizeLogThreshold(asRecord(asRecord(data).logging).level))
       broadcastAppRuntimeStatus()
+      logInfo('config', 'apply', '配置已应用：本地运行时设置已更新', {
+        currentStatus: '最新配置已应用到本地应用',
+        impact: '日志级别和界面相关设置已生效',
+        suggestion: '如涉及运行时连接参数，可检查本地服务是否按预期重连',
+      })
+    } else {
+      logFailure(
+        'config',
+        'apply',
+        '配置应用失败：设置未生效',
+        result.error || '未知错误',
+        '应用继续使用旧设置',
+        '请检查配置内容并重试保存',
+        { config: data },
+      )
     }
     return result
   })
@@ -356,6 +520,18 @@ app.whenReady().then(() => {
     return readStructuredLogs(options || {})
   })
 
+  ipcMain.handle('app-runtime:getDiagnosticEvents', (_, options?: GetDiagnosticEventsOptions) => {
+    return readDiagnosticEvents(options || {})
+  })
+
+  ipcMain.handle('app-runtime:getDiagnosticSummary', () => {
+    return getUserDiagnosticSummary()
+  })
+
+  ipcMain.handle('app-runtime:getAvailableLogDomains', () => {
+    return getAvailableLogDomains()
+  })
+
   ipcMain.handle('app-runtime:openLogsDirectory', async () => {
     const error = await shell.openPath(LOGS_DIR)
     return {
@@ -365,6 +541,14 @@ app.whenReady().then(() => {
     }
   })
 
+  ipcMain.handle('app-runtime:clearLogs', () => {
+    try {
+      const result = clearActiveLogs()
+      return { ok: true, cleared: result.cleared }
+    } catch (error) {
+      return { ok: false, cleared: [], error: String(error) }
+    }
+  })
   ipcMain.handle('app-runtime:logRenderer', (_, level: LogLevel, message: string, details?: Record<string, unknown>) => {
     writeRendererLog(level, message, details)
     return { ok: true }
@@ -456,7 +640,26 @@ app.whenReady().then(() => {
 
   // Start bundled harnessclaw engine, then connect Harnessclaw (auto-retries until engine is ready)
   startHarnessclawEngine()
-  getDb() // Initialize DB on startup
+  try {
+    getDb()
+    logInfo('storage.db', 'init', '本地数据库初始化成功', {
+      currentStatus: '会话与日志数据库已可用',
+      impact: '历史会话和统计数据可正常读写',
+      suggestion: '当前无需处理',
+    })
+  } catch (error) {
+    logFailure(
+      'storage.db',
+      'init',
+      '本地数据库初始化失败',
+      error instanceof Error ? error.message : String(error),
+      '会话历史与统计数据可能无法保存',
+      '请检查本地磁盘权限与数据库文件状态',
+      { error },
+      true,
+    )
+    throw error
+  }
   harnessclawClient.connect()
 
   harnessclawClient.on('statusChange', (status) => {
@@ -864,6 +1067,11 @@ app.on('window-all-closed', () => {
 })
 
 app.on('will-quit', () => {
+  logInfo('app.lifecycle', 'quit', '应用正在退出', {
+    currentStatus: '应用退出流程进行中',
+    impact: '本地连接与窗口将关闭',
+    suggestion: '当前无需处理',
+  })
   harnessclawClient.disconnect()
   stopHarnessclawEngine()
   closeDb()

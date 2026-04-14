@@ -20,6 +20,7 @@ export const LOGS_DIR = join(HARNESSCLAW_HOME, 'logs')
 export const APP_LOG_PATH = join(LOGS_DIR, 'app.log')
 export const RENDERER_LOG_PATH = join(LOGS_DIR, 'renderer.log')
 export const USAGE_LOG_PATH = join(LOGS_DIR, 'usage.jsonl')
+export const DIAGNOSTIC_DIR = join(LOGS_DIR, 'diagnostic')
 export const EXPORTS_DIR = join(LOGS_DIR, 'exports')
 
 export function getDefaultWorkspaceSetting(): string {

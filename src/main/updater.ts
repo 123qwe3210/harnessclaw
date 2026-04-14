@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import electronUpdater from 'electron-updater'
+import { recordFailure, recordMilestone } from './logging'
 
 const { autoUpdater } = electronUpdater
 
@@ -71,10 +72,29 @@ async function checkForUpdates(window: BrowserWindow): Promise<void> {
   checkInFlight = true
   try {
     sendUpdateEvent(window, 'checking')
+    recordMilestone({
+      domain: 'app.lifecycle',
+      action: 'update.check',
+      summary: '已开始检查应用更新',
+      source: 'updater',
+      details: {
+        currentStatus: '更新检查进行中',
+        impact: '如有新版本会提示下载',
+        suggestion: '当前无需处理',
+      },
+    })
     await autoUpdater.checkForUpdates()
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    console.error('[AutoUpdater] check failed:', message)
+    recordFailure({
+      domain: 'app.lifecycle',
+      action: 'update.check',
+      summary: '检查更新失败',
+      source: 'updater',
+      reason: message,
+      impact: '不会影响当前使用，但无法得知是否有新版本',
+      suggestion: '请检查网络连接后稍后重试',
+    })
     sendUpdateEvent(window, 'error', { message })
   } finally {
     checkInFlight = false
@@ -126,7 +146,15 @@ export function setupAutoUpdater(window: BrowserWindow): void {
       : error instanceof Error
         ? error.message
         : String(error)
-    console.error('[AutoUpdater] error:', message)
+    recordFailure({
+      domain: 'app.lifecycle',
+      action: 'update.error',
+      summary: '自动更新流程异常',
+      source: 'updater',
+      reason: message,
+      impact: '更新功能暂时不可用，但不影响当前版本继续运行',
+      suggestion: '请稍后重试更新或查看日志排查',
+    })
     sendUpdateEvent(window, 'error', { message })
   })
 

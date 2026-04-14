@@ -1284,25 +1284,132 @@ function StorageSection() {
   )
 }
 
-type LogViewerLevel = 'error' | 'info' | 'debug'
+type LogViewerLevel = 'all' | 'fatal' | 'error' | 'warn' | 'info' | 'debug'
 type LogViewerFile = 'all' | 'app' | 'renderer'
+type DiagnosticDomain =
+  | 'all'
+  | 'app.lifecycle'
+  | 'config'
+  | 'runtime.nanobot'
+  | 'runtime.gateway'
+  | 'runtime.harnessclaw'
+  | 'runtime.clawhub'
+  | 'comm.websocket'
+  | 'chat'
+  | 'doctor'
+  | 'storage.db'
+  | 'storage.files'
+  | 'ui'
+  | 'ipc'
+
+type RuntimeDomain = Exclude<DiagnosticDomain, 'all'>
+
 type LogEntry = {
   cursor: string
   timestamp: number
   isoTime: string
-  level: 'debug' | 'info' | 'warn' | 'error'
+  level: 'debug' | 'info' | 'warn' | 'error' | 'fatal'
   source: string
   message: string
   metaText: string
+  meta: Record<string, unknown> | null
+  domain?: RuntimeDomain
+  action?: string
   file: 'app' | 'renderer'
   raw: string
 }
 
+type DiagnosticEvent = {
+  cursor: string
+  timestamp: number
+  ts: string
+  level: LogEntry['level']
+  domain: RuntimeDomain
+  action: string
+  status: string
+  summary: string
+  runId: string
+  source: string
+  requestId?: string
+  sessionId?: string
+  errorCode?: string
+  durationMs?: number
+  details: Record<string, unknown>
+}
+
+type SummaryItem = {
+  id: string
+  level: LogEntry['level']
+  domain: RuntimeDomain
+  title: string
+  status: string
+  isNormal: boolean
+  currentStatus: string
+  impact: string
+  suggestion: string
+  timestamp: number
+  isoTime: string
+}
+
+type LogsView = 'runtime' | 'summary'
+type SummaryLevelFilter = 'all' | SummaryItem['level']
+type AvailableLogDomain = {
+  value: RuntimeDomain
+  count: number
+}
+
+const LOG_VIEW_OPTIONS = [
+  { label: '运行日志', value: 'runtime' },
+  { label: '用户摘要', value: 'summary' },
+]
+
+const SUMMARY_LEVEL_OPTIONS = [
+  { label: '全部', value: 'all' },
+  { label: 'FATAL', value: 'fatal' },
+  { label: 'ERROR', value: 'error' },
+  { label: 'WARN', value: 'warn' },
+  { label: 'INFO', value: 'info' },
+]
+
+const DIAGNOSTIC_DOMAIN_OPTIONS = [
+  { label: '全部域', value: 'all' },
+  { label: 'app.lifecycle', value: 'app.lifecycle' },
+  { label: 'config', value: 'config' },
+  { label: 'runtime.nanobot', value: 'runtime.nanobot' },
+  { label: 'runtime.gateway', value: 'runtime.gateway' },
+  { label: 'runtime.harnessclaw', value: 'runtime.harnessclaw' },
+  { label: 'runtime.clawhub', value: 'runtime.clawhub' },
+  { label: 'comm.websocket', value: 'comm.websocket' },
+  { label: 'chat', value: 'chat' },
+  { label: 'doctor', value: 'doctor' },
+  { label: 'storage.db', value: 'storage.db' },
+  { label: 'storage.files', value: 'storage.files' },
+  { label: 'ui', value: 'ui' },
+  { label: 'ipc', value: 'ipc' },
+]
+
+const DIAGNOSTIC_DOMAIN_ORDER: RuntimeDomain[] = [
+  'app.lifecycle',
+  'config',
+  'runtime.nanobot',
+  'runtime.gateway',
+  'runtime.harnessclaw',
+  'runtime.clawhub',
+  'comm.websocket',
+  'chat',
+  'doctor',
+  'storage.db',
+  'storage.files',
+  'ui',
+  'ipc',
+]
+
 function getLogBadgeClass(level: LogEntry['level']): string {
+  if (level === 'fatal') return 'bg-neutral-950 text-red-100 border-red-700'
   if (level === 'error') return 'bg-red-50 text-red-700 border-red-200'
   if (level === 'warn') return 'bg-amber-50 text-amber-700 border-amber-200'
-  if (level === 'debug') return 'bg-sky-50 text-sky-700 border-sky-200'
-  return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  if (level === 'debug') return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  return 'bg-sky-50 text-sky-700 border-sky-200'
 }
 
 function formatLogTime(timestamp: number): string {
@@ -1333,37 +1440,93 @@ function mergeLogEntries(current: LogEntry[], incoming: LogEntry[]): LogEntry[] 
     .slice(0, 500)
 }
 
-function LogsSection() {
-  const { config, loading, updateConfig } = useAppConfig()
-  const logging = (config?.logging || {}) as { level?: LogViewerLevel }
-  const persistedLevel = logging.level || 'info'
+function mergeDiagnosticEntries(current: DiagnosticEvent[], incoming: DiagnosticEvent[]): DiagnosticEvent[] {
+  const merged = new Map<string, DiagnosticEvent>()
+  for (const entry of current) {
+    merged.set(entry.cursor, entry)
+  }
+  for (const entry of incoming) {
+    merged.set(entry.cursor, entry)
+  }
+  return [...merged.values()]
+    .sort((left, right) => {
+      if (left.timestamp !== right.timestamp) {
+        return right.timestamp - left.timestamp
+      }
+      return right.cursor.localeCompare(left.cursor)
+    })
+    .slice(0, 300)
+}
 
-  const [selectedLevel, setSelectedLevel] = useState<LogViewerLevel>('info')
+function formatDiagnosticDetails(details: Record<string, unknown>): string {
+  return JSON.stringify(details || {}, null, 2)
+}
+
+function LogsSection() {
+  const [activeView, setActiveView] = useState<LogsView>('runtime')
+  const [selectedLevel, setSelectedLevel] = useState<LogViewerLevel>('all')
   const [selectedFile, setSelectedFile] = useState<LogViewerFile>('all')
+  const [selectedDomain, setSelectedDomain] = useState<DiagnosticDomain>('all')
+  const [availableDomains, setAvailableDomains] = useState<AvailableLogDomain[]>([])
+  const [summaryLevelFilter, setSummaryLevelFilter] = useState<SummaryLevelFilter>('all')
   const [query, setQuery] = useState('')
   const [followMode, setFollowMode] = useState(true)
   const [entries, setEntries] = useState<LogEntry[]>([])
+  const [diagnosticEntries, setDiagnosticEntries] = useState<DiagnosticEvent[]>([])
+  const [summaryItems, setSummaryItems] = useState<SummaryItem[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
+  const [diagnosticCursor, setDiagnosticCursor] = useState<string | null>(null)
   const [loadingLogs, setLoadingLogs] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null)
-  const [expandedRows, setExpandedRows] = useState<Record<string, boolean>>({})
+  const [expandedLogRows, setExpandedLogRows] = useState<Record<string, boolean>>({})
+  const [expandedDiagnosticRows, setExpandedDiagnosticRows] = useState<Record<string, boolean>>({})
   const [reloadKey, setReloadKey] = useState(0)
 
+  const applyAvailableDomains = (domains: AvailableLogDomain[]) => {
+    setAvailableDomains(domains)
+    setSelectedDomain((current) => (
+      current === 'all' || domains.some((item) => item.value === current)
+        ? current
+        : 'all'
+    ))
+  }
+
+  const domainOptions = [
+    { label: '全部域', value: 'all' },
+    ...DIAGNOSTIC_DOMAIN_ORDER
+      .filter((domain) => availableDomains.some((item) => item.value === domain))
+      .map((domain) => ({ label: domain, value: domain })),
+  ]
+
+  const hasDomainFilter = selectedDomain !== 'all'
+
   useEffect(() => {
-    if (!loading) {
-      setSelectedLevel(persistedLevel)
+    let cancelled = false
+
+    void window.appRuntime.getAvailableLogDomains().then((domains) => {
+      if (cancelled) return
+      applyAvailableDomains(domains as AvailableLogDomain[])
+      setLoadError('')
+    }).catch((error) => {
+      if (!cancelled) {
+        setLoadError(String(error))
+      }
+    })
+
+    return () => {
+      cancelled = true
     }
-  }, [loading, persistedLevel])
+  }, [reloadKey])
+
 
   useEffect(() => {
-    if (loading) return
-
     let cancelled = false
     setLoadingLogs(true)
 
     void window.appRuntime.getLogs({
-      level: selectedLevel,
+      exactLevel: selectedLevel,
+      domain: selectedDomain,
       file: selectedFile,
       query: query.trim() || undefined,
       limit: 500,
@@ -1384,16 +1547,55 @@ function LogsSection() {
     return () => {
       cancelled = true
     }
-  }, [loading, query, reloadKey, selectedFile, selectedLevel])
+  }, [query, reloadKey, selectedDomain, selectedFile, selectedLevel])
 
   useEffect(() => {
-    if (loading || !followMode || !cursor) return
+    let cancelled = false
+    void window.appRuntime.getDiagnosticSummary().then((summary) => {
+      if (cancelled) return
+      setSummaryItems(summary.items as SummaryItem[])
+      setLoadError('')
+    }).catch((error) => {
+      if (cancelled) return
+      setLoadError(String(error))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [reloadKey])
+
+  useEffect(() => {
+    let cancelled = false
+    void window.appRuntime.getDiagnosticEvents({
+      exactLevel: selectedLevel,
+      domain: selectedDomain,
+      query: query.trim() || undefined,
+      limit: 200,
+    }).then((diagnostics) => {
+      if (cancelled) return
+      setDiagnosticEntries(diagnostics.items as DiagnosticEvent[])
+      setDiagnosticCursor(diagnostics.cursor)
+      setLoadError('')
+    }).catch((error) => {
+      if (cancelled) return
+      setLoadError(String(error))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [selectedLevel, selectedDomain, query, reloadKey])
+
+  useEffect(() => {
+    if (!followMode) return
 
     let cancelled = false
     const timer = setInterval(() => {
       void window.appRuntime.getLogs({
-        after: cursor,
-        level: selectedLevel,
+        ...(cursor ? { after: cursor } : {}),
+        exactLevel: selectedLevel,
+        domain: selectedDomain,
         file: selectedFile,
         query: query.trim() || undefined,
         limit: 200,
@@ -1401,6 +1603,11 @@ function LogsSection() {
         if (cancelled) return
         if (result.items.length > 0) {
           setEntries((current) => mergeLogEntries(current, result.items as LogEntry[]))
+          void window.appRuntime.getAvailableLogDomains().then((domains) => {
+            if (!cancelled) {
+              applyAvailableDomains(domains as AvailableLogDomain[])
+            }
+          })
         }
         setCursor(result.cursor)
         setLoadError('')
@@ -1414,26 +1621,74 @@ function LogsSection() {
       cancelled = true
       clearInterval(timer)
     }
-  }, [loading, followMode, cursor, query, selectedFile, selectedLevel])
+  }, [followMode, cursor, query, selectedDomain, selectedFile, selectedLevel])
+
+  useEffect(() => {
+    if (!followMode) return
+
+    let cancelled = false
+    const timer = setInterval(() => {
+      void window.appRuntime.getDiagnosticEvents({
+        ...(diagnosticCursor ? { after: diagnosticCursor } : {}),
+        exactLevel: selectedLevel,
+        domain: selectedDomain,
+        query: query.trim() || undefined,
+        limit: 100,
+      }).then((result) => {
+        if (cancelled) return
+        if (result.items.length > 0) {
+          setDiagnosticEntries((current) => mergeDiagnosticEntries(current, result.items as DiagnosticEvent[]))
+          void window.appRuntime.getDiagnosticSummary().then((summary) => {
+            if (!cancelled) {
+              setSummaryItems(summary.items as SummaryItem[])
+            }
+          })
+          void window.appRuntime.getAvailableLogDomains().then((domains) => {
+            if (!cancelled) {
+              applyAvailableDomains(domains as AvailableLogDomain[])
+            }
+          })
+        }
+        setDiagnosticCursor(result.cursor)
+      }).catch((error) => {
+        if (!cancelled) {
+          setLoadError(String(error))
+        }
+      })
+    }, 1500)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [followMode, diagnosticCursor, selectedLevel, selectedDomain, query])
 
   const handleLevelChange = (value: string) => {
-    const nextLevel = value as LogViewerLevel
-    setSelectedLevel(nextLevel)
-    updateConfig({ logging: { ...logging, level: nextLevel } })
+    setSelectedLevel(value as LogViewerLevel)
   }
 
   const handleReset = () => {
     setQuery('')
     setSelectedFile('all')
-    setSelectedLevel(persistedLevel)
+    setSelectedDomain('all')
+    setSelectedLevel('all')
     setFollowMode(true)
-    setExpandedRows({})
+    setExpandedLogRows({})
+    setExpandedDiagnosticRows({})
     setNotice(null)
+    setLoadError('')
     setReloadKey((current) => current + 1)
   }
 
-  const toggleExpanded = (cursorValue: string) => {
-    setExpandedRows((current) => ({
+  const toggleLogRow = (cursorValue: string) => {
+    setExpandedLogRows((current) => ({
+      ...current,
+      [cursorValue]: !current[cursorValue],
+    }))
+  }
+
+  const toggleDiagnosticRow = (cursorValue: string) => {
+    setExpandedDiagnosticRows((current) => ({
       ...current,
       [cursorValue]: !current[cursorValue],
     }))
@@ -1453,94 +1708,53 @@ function LogsSection() {
       : { ok: false, text: result.error || '导出日志失败。' })
   }
 
-  if (loading) {
-    return <div className="flex items-center justify-center py-20"><Loader2 size={20} className="animate-spin text-muted-foreground" /></div>
+
+  const handleClearLogs = async () => {
+    const confirmed = window.confirm('确认删除全部活动日志吗？这会清空 app.log、renderer.log、usage.jsonl 和诊断事件，但会保留导出的日志文件。')
+    if (!confirmed) return
+
+    const result = await window.appRuntime.clearLogs()
+    if (!result.ok) {
+      setNotice({ ok: false, text: result.error || '删除全部日志失败。' })
+      return
+    }
+
+    setEntries([])
+    setDiagnosticEntries([])
+    setSummaryItems([])
+    setAvailableDomains([])
+    setExpandedLogRows({})
+    setExpandedDiagnosticRows({})
+    setCursor(null)
+    setDiagnosticCursor(null)
+    setLoadError('')
+    setNotice({ ok: true, text: `已清空 ${result.cleared.length} 个活动日志文件。` })
+    setReloadKey((current) => current + 1)
   }
+  const visibleSummaryItems = summaryLevelFilter === 'all'
+    ? summaryItems
+    : summaryItems.filter((item) => item.level === summaryLevelFilter)
 
   return (
-    <div className="h-full overflow-hidden">
-      <div className="h-full max-w-5xl mx-auto px-8 py-8 flex flex-col">
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-5xl px-8 py-8">
         <SectionHeader icon={FileText} title="日志" subtitle="合并查看 app.log 与 renderer.log，支持筛选、搜索与实时跟随。" />
 
-        <div className="rounded-2xl border border-border bg-card shadow-sm p-4 mb-5">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-            <div className="flex-1 min-w-0">
-              <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                <input
-                  type="text"
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="搜索消息、来源或元数据"
-                  className="w-full h-10 pl-9 pr-3 rounded-xl border border-border bg-background text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
-                />
-              </div>
+        <div className="mb-5 rounded-2xl border border-border bg-card p-4 shadow-sm">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-foreground">日志视图</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {activeView === 'runtime'
+                  ? '运行日志视图保留筛选条、运行日志列表和诊断事件流。'
+                  : '用户摘要视图只展示摘要卡片，避免与运行日志混排。'}
+              </p>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Segment
-                options={[
-                  { label: '错误', value: 'error' },
-                  { label: '标准', value: 'info' },
-                  { label: '调试', value: 'debug' },
-                ]}
-                value={selectedLevel}
-                onChange={handleLevelChange}
-              />
-              <Segment
-                options={[
-                  { label: '全部', value: 'all' },
-                  { label: 'app.log', value: 'app' },
-                  { label: 'renderer.log', value: 'renderer' },
-                ]}
-                value={selectedFile}
-                onChange={(value) => setSelectedFile(value as LogViewerFile)}
-              />
-            </div>
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <span className={cn(
-                'inline-flex items-center gap-1 rounded-full border px-2.5 py-1',
-                followMode ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'
-              )}>
-                <span className={cn('w-2 h-2 rounded-full', followMode ? 'bg-emerald-500' : 'bg-amber-500')} />
-                {followMode ? '跟随中' : '已暂停'}
-              </span>
-              <span>日志目录：{defaultLogsDisplayPath}</span>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                onClick={() => setFollowMode((current) => !current)}
-                className="h-9 px-3 rounded-lg border border-border bg-card hover:bg-muted transition-colors text-sm text-foreground flex items-center gap-1.5"
-              >
-                {followMode ? <Pause size={14} /> : <Play size={14} />}
-                {followMode ? '暂停刷新' : '恢复刷新'}
-              </button>
-              <button
-                onClick={handleReset}
-                className="h-9 px-3 rounded-lg border border-border bg-card hover:bg-muted transition-colors text-sm text-foreground flex items-center gap-1.5"
-              >
-                <RotateCcw size={14} />
-                重置筛选
-              </button>
-              <button
-                onClick={() => void handleOpenLogsDirectory()}
-                className="h-9 px-3 rounded-lg border border-border bg-card hover:bg-muted transition-colors text-sm text-foreground flex items-center gap-1.5"
-              >
-                <FolderOpen size={14} />
-                打开日志目录
-              </button>
-              <button
-                onClick={() => void handleExportLogs()}
-                className="h-9 px-3 rounded-lg bg-foreground text-background hover:bg-foreground/90 transition-colors text-sm font-medium flex items-center gap-1.5"
-              >
-                <Download size={14} />
-                导出日志
-              </button>
-            </div>
+            <Segment
+              options={LOG_VIEW_OPTIONS.map((option) => ({ label: option.label, value: option.value }))}
+              value={activeView}
+              onChange={(value) => setActiveView(value as LogsView)}
+            />
           </div>
         </div>
 
@@ -1554,106 +1768,323 @@ function LogsSection() {
         )}
 
         {loadError && (
-          <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600 flex items-center gap-2">
+          <div className="mb-4 flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
             <AlertTriangle size={15} />
             <span className="flex-1">读取日志失败：{loadError}</span>
             <button
               onClick={() => setReloadKey((current) => current + 1)}
-              className="h-7 px-2.5 rounded-md border border-red-200 bg-white text-red-600 hover:bg-red-50 transition-colors"
+              className="h-7 rounded-md border border-red-200 bg-white px-2.5 text-red-600 transition-colors hover:bg-red-50"
             >
               重试
             </button>
           </div>
         )}
 
-        <div className="flex-1 min-h-0 rounded-2xl border border-border bg-card shadow-sm overflow-hidden">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-            <div>
-              <p className="text-sm font-semibold text-foreground">日志列表</p>
-              <p className="text-xs text-muted-foreground">当前展示 {entries.length} 条合并日志，来源于 app.log 与 renderer.log</p>
-            </div>
-            {(loadingLogs || (followMode && entries.length === 0)) && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Loader2 size={14} className="animate-spin" />
-                加载中
+        <section className={cn('space-y-5', activeView !== 'runtime' && 'hidden')} aria-hidden={activeView !== 'runtime'}>
+          <div className="rounded-2xl border border-border bg-card p-4 shadow-sm">
+            <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+              <div className="min-w-0 flex-1">
+                <div className="relative">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="text"
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="搜索消息、来源或元数据"
+                    className="h-10 w-full rounded-xl border border-border bg-background pl-9 pr-3 text-sm text-foreground outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </div>
               </div>
-            )}
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Segment
+                  options={[
+                    { label: '全部', value: 'all' },
+                    { label: '致命', value: 'fatal' },
+                    { label: '错误', value: 'error' },
+                    { label: '警告', value: 'warn' },
+                    { label: '标准', value: 'info' },
+                    { label: '调试', value: 'debug' },
+                  ]}
+                  value={selectedLevel}
+                  onChange={handleLevelChange}
+                />
+                <Segment
+                  options={[
+                    { label: '全部', value: 'all' },
+                    { label: 'app.log', value: 'app' },
+                    { label: 'renderer.log', value: 'renderer' },
+                  ]}
+                  value={selectedFile}
+                  onChange={(value) => setSelectedFile(value as LogViewerFile)}
+                />
+                <SelectInput
+                  value={selectedDomain}
+                  onChange={(value) => setSelectedDomain(value as DiagnosticDomain)}
+                  options={domainOptions}
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span className={cn(
+                  'inline-flex items-center gap-1 rounded-full border px-2.5 py-1',
+                  followMode ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-700'
+                )}>
+                  <span className={cn('h-2 w-2 rounded-full', followMode ? 'bg-emerald-500' : 'bg-amber-500')} />
+                  {followMode ? '跟随中' : '已暂停'}
+                </span>
+                <span>日志目录：{defaultLogsDisplayPath}</span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setFollowMode((current) => !current)}
+                  className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm text-foreground transition-colors hover:bg-muted"
+                >
+                  {followMode ? <Pause size={14} /> : <Play size={14} />}
+                  {followMode ? '暂停刷新' : '恢复刷新'}
+                </button>
+                <button
+                  onClick={handleReset}
+                  className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm text-foreground transition-colors hover:bg-muted"
+                >
+                  <RotateCcw size={14} />
+                  重置筛选
+                </button>
+                <button
+                  onClick={() => void handleOpenLogsDirectory()}
+                  className="flex h-9 items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-sm text-foreground transition-colors hover:bg-muted"
+                >
+                  <FolderOpen size={14} />
+                  打开日志目录
+                </button>
+                <button
+                  onClick={() => void handleClearLogs()}
+                  className="flex h-9 items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-3 text-sm font-medium text-red-600 transition-colors hover:bg-red-100"
+                >
+                  <Trash2 size={14} />
+                  删除全部日志
+                </button>
+                <button
+                  onClick={() => void handleExportLogs()}
+                  className="flex h-9 items-center gap-1.5 rounded-lg bg-foreground px-3 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+                >
+                  <Download size={14} />
+                  导出日志
+                </button>
+              </div>
+            </div>
           </div>
 
-          <div className="h-full overflow-y-auto">
-            {!loadingLogs && entries.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-16 text-center px-6">
-                <FileText size={28} className="text-muted-foreground mb-3" />
-                <p className="text-sm font-medium text-foreground">
-                  {query.trim() ? '当前筛选条件下没有匹配日志。' : '暂时还没有可显示的日志。'}
-                </p>
-                <p className="text-xs text-muted-foreground mt-1">
-                  {query.trim() ? '可以尝试放宽关键词或切换日志等级。' : '新的日志会在这里自动追加显示。'}
-                </p>
+          <div className="rounded-2xl border border-border bg-card shadow-sm">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div>
+                <p className="text-sm font-semibold text-foreground">运行日志</p>
+                <p className="text-xs text-muted-foreground">当前展示 {entries.length} 条合并日志，来源于 app.log 与 renderer.log。</p>
               </div>
-            ) : (
-              <div className="divide-y divide-border">
-                {entries.map((entry) => {
-                  const expanded = Boolean(expandedRows[entry.cursor])
-                  return (
-                    <div key={entry.cursor} className="px-4 py-3">
-                      <button onClick={() => toggleExpanded(entry.cursor)} className="w-full text-left">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-2 mb-2">
-                              <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase', getLogBadgeClass(entry.level))}>
-                                {entry.level}
-                              </span>
-                              <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
-                                {entry.file === 'app' ? 'app.log' : 'renderer.log'}
-                              </span>
-                              <span className="text-xs font-mono text-muted-foreground break-all">{entry.source}</span>
-                            </div>
-                            <div className="flex items-start gap-2">
-                              {expanded ? <ChevronDown size={15} className="mt-0.5 text-muted-foreground flex-shrink-0" /> : <ChevronRight size={15} className="mt-0.5 text-muted-foreground flex-shrink-0" />}
-                              <div className="min-w-0">
-                                <p className="text-sm text-foreground break-words">{summarizeLog(entry)}</p>
-                                <p className="text-xs text-muted-foreground mt-1">{formatLogTime(entry.timestamp)}</p>
+              {(loadingLogs || (followMode && entries.length === 0)) && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Loader2 size={14} className="animate-spin" />
+                  加载中
+                </div>
+              )}
+            </div>
+
+            <div className="max-h-[36rem] overflow-y-auto">
+              {!loadingLogs && entries.length === 0 ? (
+                <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+                  {hasDomainFilter && !query.trim() && (
+                    <p className="mb-2 text-xs text-muted-foreground">当前域：{selectedDomain}</p>
+                  )}
+                  <FileText size={28} className="mb-3 text-muted-foreground" />
+                  <p className="text-sm font-medium text-foreground">
+                    {query.trim() ? '当前筛选条件下没有匹配日志。' : '暂时还没有可展示的运行日志。'}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {query.trim() ? '可以尝试放宽关键词或切换日志等级。' : '新的日志会在这里自动追加显示。'}
+                  </p>
+                </div>
+              ) : (
+                <div className="divide-y divide-border">
+                  {entries.map((entry) => {
+                    const expanded = Boolean(expandedLogRows[entry.cursor])
+                    return (
+                      <div key={entry.cursor} className="px-4 py-3">
+                        <button onClick={() => toggleLogRow(entry.cursor)} className="w-full text-left">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="mb-2 flex flex-wrap items-center gap-2">
+                                <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase', getLogBadgeClass(entry.level))}>
+                                  {entry.level}
+                                </span>
+                                <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                                  {entry.file === 'app' ? 'app.log' : 'renderer.log'}
+                                </span>
+                                {entry.domain && (
+                                  <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                                    {entry.domain}
+                                  </span>
+                                )}
+                                <span className="break-all text-xs font-mono text-muted-foreground">{entry.source}</span>
+                                {entry.action && (
+                                  <span className="text-xs text-muted-foreground">{entry.action}</span>
+                                )}
+                              </div>
+                              <div className="flex items-start gap-2">
+                                {expanded ? <ChevronDown size={15} className="mt-0.5 shrink-0 text-muted-foreground" /> : <ChevronRight size={15} className="mt-0.5 shrink-0 text-muted-foreground" />}
+                                <div className="min-w-0">
+                                  <p className="break-words text-sm text-foreground">{summarizeLog(entry)}</p>
+                                  <p className="mt-1 text-xs text-muted-foreground">{formatLogTime(entry.timestamp)}</p>
+                                </div>
                               </div>
                             </div>
                           </div>
-                        </div>
-                      </button>
+                        </button>
 
-                      {expanded && (
-                        <div className="mt-3 ml-6 rounded-xl border border-border bg-background/60 p-3 space-y-3">
-                          <div>
-                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Message</p>
-                            <pre className="whitespace-pre-wrap break-words text-sm text-foreground font-mono">{entry.message || '(empty)'}</pre>
-                          </div>
-
-                          {entry.metaText && (
+                        {expanded && (
+                          <div className="ml-6 mt-3 space-y-3 rounded-xl border border-border bg-background/60 p-3">
                             <div>
-                              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Metadata</p>
-                              <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground font-mono">{entry.metaText}</pre>
+                              <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Message</p>
+                              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-sm text-foreground">{entry.message || '(empty)'}</pre>
                             </div>
-                          )}
 
-                          <div>
-                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">Raw</p>
-                            <pre className="whitespace-pre-wrap break-words text-xs text-muted-foreground font-mono">{entry.raw}</pre>
+                            {entry.metaText && (
+                              <div>
+                                <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Metadata</p>
+                                <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-muted-foreground">{entry.metaText}</pre>
+                              </div>
+                            )}
+
+                            <div>
+                              <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Raw</p>
+                              <pre className="max-h-56 overflow-auto whitespace-pre font-mono text-xs text-muted-foreground">{entry.raw}</pre>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-border bg-card shadow-sm">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div>
+                <p className="text-sm font-semibold text-foreground">诊断事件流</p>
+                <p className="text-xs text-muted-foreground">按 level、domain、action、summary 与时间查看结构化诊断事件。</p>
+              </div>
+              <span className="text-xs text-muted-foreground">{diagnosticEntries.length} 条</span>
+            </div>
+
+            <div className="max-h-[32rem] overflow-y-auto divide-y divide-border">
+              {diagnosticEntries.length === 0 ? (
+                <div className="px-4 py-10 text-center text-sm text-muted-foreground">暂无可展示的诊断事件。</div>
+              ) : diagnosticEntries.map((entry) => {
+                const expanded = Boolean(expandedDiagnosticRows[entry.cursor])
+                return (
+                  <div key={entry.cursor} className="px-4 py-3">
+                    <button onClick={() => toggleDiagnosticRow(entry.cursor)} className="w-full text-left">
+                      <div className="flex items-start gap-2">
+                        {expanded ? <ChevronDown size={15} className="mt-0.5 shrink-0 text-muted-foreground" /> : <ChevronRight size={15} className="mt-0.5 shrink-0 text-muted-foreground" />}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase', getLogBadgeClass(entry.level))}>
+                              {entry.level}
+                            </span>
+                            <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                              {entry.domain}
+                            </span>
+                            <span className="text-xs text-muted-foreground">{entry.action}</span>
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-start justify-between gap-3">
+                            <p className="min-w-0 flex-1 break-words text-sm font-medium text-foreground">{entry.summary}</p>
+                            <span className="shrink-0 text-xs text-muted-foreground">{formatLogTime(entry.timestamp)}</span>
                           </div>
                         </div>
+                      </div>
+                    </button>
+
+                    {expanded && (
+                      <div className="ml-6 mt-3 space-y-3 rounded-xl border border-border bg-background/60 p-3">
+                        <div className="grid grid-cols-1 gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                          <p><span className="font-medium text-foreground">status：</span>{entry.status}</p>
+                          <p><span className="font-medium text-foreground">source：</span>{entry.source}</p>
+                          {entry.sessionId && <p><span className="font-medium text-foreground">sessionId：</span>{entry.sessionId}</p>}
+                          {entry.requestId && <p><span className="font-medium text-foreground">requestId：</span>{entry.requestId}</p>}
+                          {entry.errorCode && <p><span className="font-medium text-foreground">errorCode：</span>{entry.errorCode}</p>}
+                          {entry.durationMs != null && <p><span className="font-medium text-foreground">durationMs：</span>{entry.durationMs}</p>}
+                        </div>
+                        <pre className="max-h-72 overflow-auto whitespace-pre rounded-xl border border-border bg-background p-3 font-mono text-xs text-muted-foreground">{formatDiagnosticDetails(entry.details)}</pre>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section className={cn('space-y-5', activeView !== 'summary' && 'hidden')} aria-hidden={activeView !== 'summary'}>
+          <div className="rounded-2xl border border-border bg-card p-4 shadow-sm">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-foreground">用户摘要</p>
+                <p className="mt-1 text-xs text-muted-foreground">正常 INFO 仅展示当前状态；异常或进行中的事件展示影响与建议。</p>
+              </div>
+              <Segment
+                options={SUMMARY_LEVEL_OPTIONS.map((option) => ({ label: option.label, value: option.value }))}
+                value={summaryLevelFilter}
+                onChange={(value) => setSummaryLevelFilter(value as SummaryLevelFilter)}
+              />
+            </div>
+          </div>
+
+          {visibleSummaryItems.length === 0 ? (
+            <div className="rounded-2xl border border-border bg-card px-6 py-16 text-center shadow-sm">
+              <FileText size={28} className="mx-auto mb-3 text-muted-foreground" />
+              <p className="text-sm font-medium text-foreground">当前等级下暂无可展示的摘要。</p>
+              <p className="mt-1 text-xs text-muted-foreground">可以切换等级，或等待新的诊断摘要生成。</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {visibleSummaryItems.map((item) => {
+                const showDetails = !item.isNormal
+                return (
+                  <div key={item.id} className="rounded-2xl border border-border bg-card p-4 shadow-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className={cn('inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase', getLogBadgeClass(item.level))}>
+                        {item.level}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{formatLogTime(item.timestamp)}</span>
+                    </div>
+                    <p className="mt-3 text-sm font-semibold text-foreground">{item.title}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <span>{item.domain}</span>
+                      <span className="inline-flex items-center rounded-full border border-border bg-muted px-2 py-0.5">{item.status}</span>
+                    </div>
+                    <div className="mt-4 space-y-2 text-sm">
+                      <p className="text-foreground"><span className="font-medium">当前状态：</span>{item.currentStatus}</p>
+                      {showDetails && (
+                        <>
+                          <p className="text-muted-foreground"><span className="font-medium text-foreground">影响：</span>{item.impact || '请结合诊断事件流确认具体影响。'}</p>
+                          <p className="text-muted-foreground"><span className="font-medium text-foreground">建议：</span>{item.suggestion || '请查看诊断事件流获取更多细节。'}</p>
+                        </>
                       )}
                     </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
       </div>
     </div>
   )
 }
-
-// ─── Nav ───────────────────────────────────────────────────────────────────
-
 type SectionKey = 'connection' | 'auth' | 'models' | 'agents' | 'channels' | 'tools' | 'ui' | 'storage' | 'logs'
 
 const navGroups: { title: string; items: { key: SectionKey; icon: React.ElementType; label: string }[] }[] = [

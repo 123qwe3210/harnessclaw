@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "main": "out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node scripts/electron-vite-runner.cjs dev",
+    "dev:renderer": "vite --config vite.renderer.config.ts",
     "build": "electron-vite build",
     "rebuild:electron-native": "electron-builder install-app-deps",
     "bundle:tools": "node scripts/build-bundled-tools.cjs",
@@ -13,7 +14,7 @@
     "dist:mac": "yarn build && electron-builder --config electron-builder.config.cjs --mac --publish never",
     "dist:win": "yarn build && electron-builder --config electron-builder.config.cjs --win --publish never",
     "release": "yarn build && electron-builder --config electron-builder.config.cjs --publish always",
-    "preview": "electron-vite preview",
+    "preview": "node scripts/electron-vite-runner.cjs preview",
     "lint": "eslint . --ext .ts,.tsx"
   },
   "devDependencies": {
